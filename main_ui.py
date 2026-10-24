@@ -13,7 +13,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from fastapi import WebSocket, WebSocketDisconnect
 from nicegui import app, ui
 
-from agent_core import BUDGET_USD, SYNTH_EVERY, AgentCore, AnalysisResult
+from agent_core import SYNTH_EVERY, AgentCore, AnalysisResult
 from audio_engine import AudioConfig, AudioEngine, RawCapture
 from diarizer import Embedder, VoiceTracker, ensure_model
 from providers import (AnthropicProvider, DeepgramLive, GeminiProvider, GeminiTranscriber, LoginError, clear_credentials,
@@ -1084,39 +1084,8 @@ def bar(label: str, v: Optional[float], bipolar: bool = False) -> str:
             f'<span class="bar-val">{v:.0f}</span></div>')
 
 
-DASH = ["", "6 3", "2 3", "10 3 2 3", "1 2", "12 4"]
 INTERVENTION_LABEL = {"probe_question": "PROBE", "reframe": "REFRAME", "acknowledge": "ACKNOWLEDGE", "pause": "PAUSE",
                       "boundary": "BOUNDARY", "redirect": "REDIRECT", "hold": "HOLD"}
-
-
-def tension_svg(results: List[AnalysisResult]) -> Tuple[str, str]:
-    pts = [(r.speaker_id, r.insight.cognitive_tension_score) for r in results if r.insight][-40:]
-    if not pts:
-        return '<div class="empty" style="padding:30px 0;border:var(--rule)">NO DATA YET</div>', ""
-    w, h = 300, 84
-    n = len(pts)
-
-    def x(i: int) -> float:
-        return 6 + (w - 12) * (i / max(1, n - 1))
-
-    def y(t: float) -> float:
-        return h - 6 - (h - 12) * (t - 1) / 9
-
-    parts = [f'<line x1="0" x2="{w}" y1="{y(t):.1f}" y2="{y(t):.1f}" stroke="currentColor" stroke-width="1" opacity=".25" stroke-dasharray="2 4"/>'
-             for t in (4, 7)]
-    legend = []
-    for label in dict.fromkeys(s for s, _ in pts):
-        idx = spk_index(label)
-        coords = [(x(i), y(t)) for i, (s, t) in enumerate(pts) if s == label]
-        if len(coords) > 1:
-            pl = " ".join(f"{a:.1f},{b:.1f}" for a, b in coords)
-            parts.append(f'<polyline points="{pl}" fill="none" stroke="currentColor" stroke-width="2" stroke-dasharray="{DASH[idx]}"/>')
-        fill = "currentColor" if idx % 2 == 0 else "var(--paper)"
-        parts += [f'<rect x="{a - 3:.1f}" y="{b - 3:.1f}" width="6" height="6" style="fill:{fill}" stroke="currentColor" stroke-width="1.5"/>'
-                  for a, b in coords]
-        legend.append(f'<span><span class="ln" style="border-top-style:{"solid" if not DASH[idx] else "dashed"}"></span>{e(label)}</span>')
-    svg = f'<svg viewBox="0 0 {w} {h}" preserveAspectRatio="none">{"".join(parts)}</svg>'
-    return svg, f'<div class="legend">{"".join(legend)}</div>'
 
 
 def render_side() -> str:
@@ -1307,7 +1276,7 @@ def header_html() -> str:
 FEED_HTML = f"""
 <div class="feed hidden" id="oxm-feed">
   <div class="panel-head"><span>TEXT INPUT</span>
-    <span><button class="btn btn-small" onclick='oxm.sample({json.dumps(SAMPLE)})'>LOAD SAMPLE</button></span></div>
+    <span><button class="btn btn-small" onclick="oxm.sample({html.escape(json.dumps(SAMPLE), quote=True)})">LOAD SAMPLE</button></span></div>
   <textarea id="oxm-feed-text" rows="5" placeholder="Paste a transcript. One line per turn, optionally 'Name: text'. It is streamed line by line into the analysis."></textarea>
   <div class="feed-controls">
     <label>WORDS/MIN <input type="range" id="oxm-wpm" min="60" max="400" step="10" value="160"
@@ -1413,7 +1382,7 @@ def index() -> None:
             elif cmd == "source" and value in SOURCES:
                 if S.recording:
                     await stop_recording()
-                S.source = value
+                S.source, S.error = value, ""
             elif cmd == "lang" and value in LANGS:
                 S.lang = value
                 if S.recording and S.source == "auto":
@@ -1463,7 +1432,11 @@ def index() -> None:
                     if not text.strip():
                         ui.notify("Paste a transcript or load the sample first.")
                     else:
+                        S.error = ""
                         S.feed_task = asyncio.create_task(run_feed(text, int((value or {}).get("wpm", 160))))
+        except RuntimeError as exc:          # expected, user-facing problems (missing key, device, ...)
+            log.warning("command %s: %s", cmd, exc)
+            S.error = str(exc)
         except Exception as exc:
             log.exception("command %s failed", cmd)
             S.error = f"{type(exc).__name__}: {exc}"

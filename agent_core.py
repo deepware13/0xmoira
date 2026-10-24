@@ -560,6 +560,12 @@ class AgentCore:
             result = await self._analyze(payload, entry, context, baseline)
         except asyncio.CancelledError:
             raise
+        except BudgetExceeded as exc:
+            log.warning("%s", exc)
+            self.last_error = str(exc)
+            result = AnalysisResult(payload.utterance_id, payload.speaker, payload.text, None,
+                                    0.0, 0.0, self.budget.spent, f"error: {exc}", time.time(),
+                                    unreliable=payload.unreliable)
         except Exception as exc:  # keep the pipeline alive no matter what
             log.exception("Analysis failed")
             self.last_error = f"{type(exc).__name__}: {exc}"
