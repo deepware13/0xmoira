@@ -68,7 +68,7 @@ python3.12 -m venv .venv            # Python 3.11 or newer
 |---|---|---|---|
 | **Mic · Deepgram** | Deepgram key. The browser streams 16 kHz PCM to the app, which relays it to Deepgram `nova-3`. | Voice-based diarization | Sub-second (vendor specification; not benchmarked here) |
 | **System audio · Deepgram** | Deepgram key and an input device that carries the call audio (e.g. BlackHole 2ch) | Voice-based diarization | Same as above |
-| **Mic · browser speech** | Chrome, Edge or Safari (Web Speech API) | None. Set the current speaker with the A–D badges. | Sub-second |
+| **Mic · auto speakers** (default without Deepgram) | Chrome, Edge or Safari. Text from the browser's speech recognition; the mic is also streamed to the app for speaker detection. | Automatic, from the voice: WeSpeaker ResNet34 voice prints on this Mac, clustered live (§3.1a) | Sub-second |
 | **System audio · Gemini** | Gemini key | Gemini assigns labels per audio chunk | 1–3 s per chunk |
 | **System audio · ASR endpoint** | `OXMOIRA_ASR_URL` returning `{utterance_id, speaker, text, duration_ms}` | From the endpoint | Depends on the endpoint |
 | **Text** | None | `Name: text` per line | Simulated at a chosen words-per-minute rate |
@@ -124,6 +124,17 @@ $$\text{speech}_t \iff r_t \ge \max(r_{\min},\, k\,\hat n), \qquad \hat n \lefta
 
 with $r_{\min}=0.006$ and $k=3$. A turn ends after 450 ms of silence or 8 s of speech, and includes 300 ms of pre-roll audio. Chunks are transcribed concurrently (up to 3 at a time) but emitted strictly in order.
 
+### 3.1a Automatic speaker detection without a cloud diarizer
+
+In **auto** mode the browser's speech recognition produces the text, and the same microphone stream goes to the app over a WebSocket. There:
+
+1. An energy-based voice activity detector cuts voiced segments (250 ms of silence ends a segment; 6 s maximum).
+2. Each segment gets a 256-dimensional voice print from **WeSpeaker ResNet34-LM** (ONNX, CPU, about 70 ms per segment; CC BY 4.0; downloaded once, 26 MB, pinned by commit and SHA-256). Features are 80-bin Kaldi log-mel filterbanks with mean normalisation; the filterbank matches the prototype's reference matrix exactly.
+3. After every new segment, all segments of the session are re-clustered: agglomerative, average linkage, cosine distance, threshold 0.41. Segments under 1.5 s cannot found a speaker of their own; groups under 3 s of speech are folded into the nearest established speaker. Labels stay stable through Hungarian matching on speaking time. When the clustering revises an earlier segment, the matching transcript line is relabelled in place.
+4. A finished transcript line is assigned to the speaker with the most voiced time inside the window it was most likely spoken in: [t_final − 1.2 s − words/4 s, t_final + 0.3 s].
+
+**Test.** A scripted conversation with four synthetic voices (macOS Daniel, Karen, Moira, Tessa), 12 turns, 0.35 s pauses: all 12 turns got the correct speaker. Same-voice cosine similarity was 0.87 ± 0.03; different voices 0.19 ± 0.09, at most 0.35. Synthetic voices from the same synthesis engine scored up to 0.86 against each other and could not be separated, so real voices in real rooms need their own evaluation (§10).
+
 ### 3.2 Live read
 
 Each turn becomes one stateless request. The request contains:
@@ -145,7 +156,7 @@ The answer is constrained by a JSON Schema: Anthropic structured outputs (`outpu
 | 4 | `dominance`, `stress`, `defensiveness`, `confidence`, `agitation`, `coherence` | 0…100 | Neutral speech scores 40–60. Values beyond 20 or 80 need a clear cue. |
 | 5 | `underlying_intent` | one sentence | Phrased as an inference, hedged once |
 | 6 | `flags[≤3]` | verbatim phrase, category, reason, severity | Categories: defense, power, deceptive, evasive, contradiction, difficult, emotional |
-| 7 | `ideas[≤1]` | verbatim source, kind, novelty 0–100, "spin" | |
+| 7 | `ideas[≤1]` | verbatim source, kind, novelty 0–100, "spin" | Shown prominently under the next move |
 | 8 | `intervention_type`, `tactical_action` | enum; ≤ 25 words | probe, reframe, acknowledge, pause, boundary, redirect, hold |
 
 **Latency.** For live reads the model's extended thinking is switched off (`thinking: {type: "between_tools"}` on Sonnet 5.5) and effort is set to `low`. The synthesis keeps adaptive thinking at `medium` effort. §5 has the measured effect.
@@ -178,7 +189,7 @@ Every $N=6$ analysed turns, or on demand via **ANALYSE NOW**, a separate backgro
 - the most novel ideas;
 - the previous assessment, marked as usable for continuity and trend only, not as evidence.
 
-The model first collects 4–10 **tells**: verbatim quotes, each paired with the mechanism it reveals. It then writes the headline, situation, per-speaker profiles, dynamics, undercurrent, risks, recommendation and trend. Each speaker profile has ten fields: role, evidence, state, motives, defences, relation, subtext, bottom line, lever and credibility.
+The model first collects 4–10 **tells**: verbatim quotes, each paired with the mechanism it reveals. It then writes the headline, situation, per-speaker profiles, dynamics, undercurrent, risks, recommendation and trend. Two fields focus on ideas: **idea to bet on** (the one raised idea worth pursuing, and where it could lead) and 2–3 **sparks**: new ideas the model develops from the conversation, each built with a named creativity technique (inversion, analogy, combination, extreme, omission, perspective, provocation), tied to a quote, and paired with the smallest test that could be run within a week. Each speaker profile has ten fields: role, evidence, state, motives, defences, relation, subtext, bottom line, lever and credibility.
 
 Speakers with fewer than 25 words get "insufficient material" in every deep field. This is enforced in code, not just requested in the prompt.
 
@@ -268,6 +279,7 @@ Claude prices for the cost estimate come from a table in `providers.py`. Unknown
 ├── main_ui.py        NiceGUI app: sign-in, dashboard, audio WebSocket relay, export
 ├── agent_core.py     Live reads, baselines, verification, synthesis, budget
 ├── providers.py      Anthropic / Gemini clients, Deepgram live streaming, credentials
+├── diarizer.py       Automatic speaker detection: VAD, WeSpeaker voice prints, online clustering
 ├── audio_engine.py   PortAudio capture, VAD chunking, raw streaming capture
 ├── requirements.txt  Pinned dependencies
 └── docs/             Screenshots
@@ -279,6 +291,7 @@ Claude prices for the cost estimate come from a table in `providers.py`. Unknown
 
 - **Network binding.** The server listens on `127.0.0.1` only.
 - **Keys.** API keys are verified on the server and kept in process memory. They are never sent to the browser. If you choose to save them, they are written atomically to `~/.oxmoira/credentials.json` with file mode `0600` in a `0700` directory.
+- **Voice prints.** In auto mode, voice prints are computed and kept in memory on this Mac only, and discarded when the session is cleared. They are biometric data.
 - **Data flows.** With the Deepgram sources, raw audio goes to Deepgram. With the Gemini source, audio goes to Google. With browser speech, audio goes to the browser vendor's recognition service. Transcript text goes to the chosen LLM provider. Nothing is stored by 0xmoira except the spend counter and, if you choose, an exported Markdown report.
 - **Rendering.** All model and transcript text is HTML-escaped before rendering.
 

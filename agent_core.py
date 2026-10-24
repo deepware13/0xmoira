@@ -108,6 +108,8 @@ Lines tagged `(transcript confidence N %, UNRELIABLE)` and garbled passages are 
   - `credibility` (max 20 words): how well the statements are supported by concrete detail and consistency, with the reason.
 - `dynamics` (2-4 sentences): the system between the speakers: who holds power and how (French and Raven: position, expertise, reward, coercion, likability); status moves (high and low status); alliances and who is left out; the game being played (Berne: "Yes, but", "wooden leg"); drama-triangle roles and how they switch; symmetric or complementary escalation (Watzlawick); the group's basic assumption (Bion: dependency, fight or flight, pairing); groupthink. For a monologue, the speaker's relation to the implied audience.
 - `undercurrent` (1-2 sentences): what is in the room but nobody says: the unspoken conflict, the elephant, the real agenda behind the official one, the shared fear.
+- `idea_bet` (1-3 sentences): the ONE idea raised in the conversation you would bet on, who raised it, why, and what it could become if pushed further. If no real proposal was raised, say so plainly and name the problem that most needs one.
+- `sparks` (2-3 entries): NEW ideas you develop yourself from the conversation material, each aimed at one of its core problems. `problem` (max 12 words): the problem it attacks. `technique`: one of inversion, analogy (transfer a mechanism from a distant field, name the field), combination (fuse two things said), extreme (10x bigger or smaller), omission (drop the supposedly essential part), perspective (from a stakeholder not in the room), provocation. `spark` (max 30 words): the idea, concrete and vivid, saying who does what. `builds_on` (max 15 words): "<speaker>: quote or paraphrase" it grows from. `first_test` (max 25 words): the smallest experiment within a week and what counts as success. Prefer surprising over obvious; never a competition, ranking, points or other game element, never just a tool, template or meeting.
 - `risks` (1-2 sentences): evasion, contradiction and defence patterns worth a closer look, and possible deception only when several flags agree. If none, say the speech appears straightforward.
 - `recommendation` (max 25 words): the single most useful next move now: imperative, concrete, naming the decisive detail ("Next: pin the Friday risk to one named blocker before anyone agrees to a date."). If the conversation gives no basis yet, say so in one short sentence.
 - `trend` (one sentence): how the picture changed against the previous assessment (calmer, more defensive, a mask slipped, new alliance, new topic). With no previous assessment, say this is the first.
@@ -209,6 +211,21 @@ SYNTH_SCHEMA: Dict[str, Any] = strict_schema({
             },
             "dynamics": {"type": "string"},
             "undercurrent": {"type": "string"},
+            "idea_bet": {"type": "string"},
+            "sparks": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "problem": {"type": "string"},
+                        "technique": {"type": "string", "enum": ["inversion", "analogy", "combination", "extreme",
+                                                                 "omission", "perspective", "provocation"]},
+                        "spark": {"type": "string"},
+                        "builds_on": {"type": "string"},
+                        "first_test": {"type": "string"},
+                    },
+                },
+            },
             "risks": {"type": "string"},
             "recommendation": {"type": "string"},
             "trend": {"type": "string"},
@@ -294,6 +311,14 @@ class SpeakerProfile(BaseModel):
     credibility: str = ""
 
 
+class Spark(BaseModel):
+    problem: str = ""
+    technique: str = ""
+    spark: str
+    builds_on: str = ""
+    first_test: str = ""
+
+
 class Synthesis(BaseModel):
     tells: List[Tell] = Field(default_factory=list)
     headline: str
@@ -301,6 +326,8 @@ class Synthesis(BaseModel):
     speakers: List[SpeakerProfile] = Field(default_factory=list)
     dynamics: str
     undercurrent: str = ""
+    idea_bet: str = ""
+    sparks: List["Spark"] = Field(default_factory=list)
     risks: str = ""
     recommendation: str
     trend: str = ""
@@ -713,8 +740,14 @@ class AgentCore:
                         for f in _PROFILE_FIELDS[1:]:
                             setattr(prof, f, "insufficient material")
                     profiles.append(prof)
-                syn = Synthesis(tells=tells[:10], speakers=profiles,
-                                **{k: v for k, v in data.items() if k in Synthesis.model_fields and k not in ("tells", "speakers")})
+                sparks: List[Spark] = []
+                for item in data.pop("sparks", []) or []:
+                    try:
+                        sparks.append(Spark(**item))
+                    except (ValidationError, TypeError):
+                        continue
+                syn = Synthesis(tells=tells[:10], speakers=profiles, sparks=sparks[:3],
+                                **{k: v for k, v in data.items() if k in Synthesis.model_fields and k not in ("tells", "speakers", "sparks")})
                 return syn
 
             t0 = time.monotonic()

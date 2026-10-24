@@ -15,6 +15,7 @@ from nicegui import app, ui
 
 from agent_core import BUDGET_USD, SYNTH_EVERY, AgentCore, AnalysisResult
 from audio_engine import AudioConfig, AudioEngine, RawCapture
+from diarizer import Embedder, VoiceTracker, ensure_model
 from providers import (AnthropicProvider, DeepgramLive, GeminiProvider, GeminiTranscriber, LoginError, clear_credentials,
                        deepgram_language, verify_deepgram,
                        default_anthropic_model, default_gemini_model, load_credentials, mask_key,
@@ -29,7 +30,7 @@ log = logging.getLogger("oxmoira.ui")
 SOURCES = {
     "dg_mic": "MIC · DEEPGRAM",
     "dg_system": "SYSTEM AUDIO · DEEPGRAM",
-    "browser": "MIC · BROWSER SPEECH",
+    "auto": "MIC · AUTO SPEAKERS",
     "gemini": "SYSTEM AUDIO · GEMINI",
     "endpoint": "SYSTEM AUDIO · ASR ENDPOINT",
     "text": "TEXT",
@@ -44,6 +45,7 @@ class Seg:
     speaker: str
     text: str
     t: float
+    items: List[int] = field(default_factory=list)   # voice segments behind this line (auto mode)
 
 
 @dataclass
@@ -57,11 +59,15 @@ class State:
     dg_cost: float = 0.0
     spent_start: float = 0.0
     interim: str = ""
+    embedder: Optional[Embedder] = None
+    voice: Optional[VoiceTracker] = None
+    voice_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    status_note: str = ""
     agent: Optional[AgentCore] = None
     engine: Optional[AudioEngine] = None
     pump: Optional[asyncio.Task] = None
     feed_task: Optional[asyncio.Task] = None
-    source: str = "dg_mic"
+    source: str = "auto"
     lang: str = "en-US"
     speaker: str = "A"
     recording: bool = False
@@ -102,7 +108,7 @@ def badge(label: str, extra: str = "") -> str:
 # =========================================================================== #
 # Session control
 # =========================================================================== #
-def ingest(speaker: str, text: str, confidence: Optional[int] = None) -> None:
+def ingest(speaker: str, text: str, confidence: Optional[int] = None, items: Optional[List[int]] = None) -> None:
     text = text.strip()
     if not text or S.agent is None:
         return
@@ -110,7 +116,7 @@ def ingest(speaker: str, text: str, confidence: Optional[int] = None) -> None:
         S.t0 = time.time()
     S.seq += 1
     uid = f"u{S.seq}"
-    S.segs.append(Seg(uid, speaker, text, time.time() - S.t0))
+    S.segs.append(Seg(uid, speaker, text, time.time() - S.t0, list(items or [])))
     spk_index(speaker)
     S.version += 1
     payload: Dict[str, Any] = {"utterance_id": uid, "speaker": speaker, "text": text,
@@ -124,7 +130,7 @@ async def _pump() -> None:
     assert S.engine is not None
     while True:
         utt = await S.engine.utterances.get()
-        ingest(utt.speaker_id if utt.speaker_id != "UNKNOWN" else S.speaker, utt.text)
+        ingest(utt.speaker_id if utt.speaker_id != "UNKNOWN" else "Speaker 1", utt.text)
 
 
 async def start_server_mic() -> None:
@@ -225,11 +231,69 @@ async def audio_ws(ws: WebSocket) -> None:
             S.recording = False
 
 
+def _on_relabel(changed: List[Any]) -> None:
+    """The voice clustering revised earlier segments: update the speaker of the affected transcript lines."""
+    if S.voice is None:
+        return
+    ids = {it.id for it in changed}
+    for seg in S.segs:
+        if seg.items and ids.intersection(seg.items):
+            new = S.voice.label_of(seg.items)
+            if new and new != seg.speaker:
+                seg.speaker = new
+                spk_index(new)
+                S.version += 1
+
+
+async def prepare_voice() -> None:
+    """Load (and on first use download) the speaker model; create the tracker for this session."""
+    if S.embedder is None:
+        def note(msg: str) -> None:
+            S.status_note = msg
+        path = await ensure_model(note)
+        S.status_note = "LOADING VOICE MODEL…"
+        S.embedder = await asyncio.get_running_loop().run_in_executor(None, Embedder, path)
+        S.status_note = ""
+    if S.voice is None:
+        S.voice = VoiceTracker(S.embedder, _on_relabel)
+
+
+async def auto_ingest(text: str, confidence: Optional[int], t_final: float) -> None:
+    async with S.voice_lock:
+        if S.voice is None:
+            ingest("Speaker 1", text, confidence)
+            return
+        label, ids = await S.voice.assign(t_final, len(text.split()))
+        ingest(label, text, confidence, ids)
+
+
+@app.websocket("/oxm/voice")
+async def voice_ws(ws: WebSocket) -> None:
+    """Browser microphone -> local speaker detection (auto mode)."""
+    await ws.accept()
+    if S.voice is None:
+        await ws.close(code=4001)
+        return
+    tracker = S.voice
+    try:
+        while True:
+            msg = await ws.receive()
+            if msg.get("type") == "websocket.disconnect":
+                break
+            data = msg.get("bytes")
+            if data:
+                tracker.feed(data)
+    except (WebSocketDisconnect, RuntimeError):
+        pass
+    finally:
+        tracker.flush()
+
+
 async def stop_recording() -> None:
     if S.source in ("gemini", "endpoint"):
         await stop_server_mic()
-    elif S.source == "browser":
-        ui.run_javascript("oxm.speech.stop()")
+    elif S.source == "auto":
+        ui.run_javascript("oxm.speech.stop(); oxm.mic.stop()")
     elif S.source == "dg_mic":
         ui.run_javascript("oxm.mic.stop()")
         await stop_dg()
@@ -256,6 +320,7 @@ async def new_session() -> None:
     S.dg_cost = 0.0
     S.segs.clear()
     S.speaker_order.clear()
+    S.voice = None
     S.seq = 0
     S.version += 1
     S.error = ""
@@ -295,7 +360,7 @@ async def activate(provider_name: str, key: str, model: str, gemini_key: str = "
         S.gemini_asr = S.provider
         S.gemini_asr_model = gemini_model or model
     S.deepgram_key = deepgram_key
-    S.source = "dg_mic" if deepgram_key else "browser"
+    S.source = "dg_mic" if deepgram_key else "auto"
     await new_session()
 
 
@@ -344,9 +409,6 @@ html, body { height:100%; margin:0; background:var(--paper); }
 .btn-small { padding:2px 8px; font-size:11px; font-weight:400; }
 .btn-rec.on { background:var(--ink); color:var(--paper); animation:oxblink 1s steps(2,start) infinite; }
 @keyframes oxblink { to { visibility:hidden; } }
-.chips { display:flex; gap:4px; align-items:center; }
-.chips .spk { cursor:pointer; }
-.chips .spk.sel { outline:3px solid var(--ink); outline-offset:2px; }
 
 .foot { border-top:var(--rule); border-bottom:none; font-size:11px; text-transform:uppercase; gap:20px; flex-wrap:wrap; row-gap:4px; }
 .foot span { white-space:nowrap; }
@@ -427,10 +489,21 @@ h4.sub { font-family:var(--mono); font-weight:400; font-size:9px; letter-spacing
 .speaker .stats { font-size:10px; text-transform:uppercase; opacity:.7; margin-top:2px; }
 .share { height:6px; border:1px solid var(--ink); margin-top:4px; position:relative; }
 .share i { position:absolute; top:0; bottom:0; left:0; background:var(--ink); }
-.idea { display:grid; grid-template-columns:44px 1fr; gap:10px; padding:8px 16px; border-bottom:1px solid var(--ink); }
+.idea { display:grid; grid-template-columns:56px 1fr; gap:10px; padding:8px 16px; border-bottom:1px solid var(--ink); }
 .novelty { font-family:var(--sans); font-weight:900; font-size:18px; line-height:1; }
-.novelty small { display:block; font-family:var(--mono); font-weight:400; font-size:9px; letter-spacing:.1em; opacity:.62; }
-.idea .why, .idea .spin { font-size:11px; opacity:.75; margin-top:2px; }
+.novelty small { display:block; overflow-wrap:normal; white-space:nowrap; font-family:var(--mono); font-weight:400; font-size:9px; letter-spacing:.1em; opacity:.62; }
+.idea-text { font-family:var(--sans); font-weight:900; font-size:14px; line-height:1.2; text-transform:uppercase; letter-spacing:-.01em; }
+.idea .why, .idea .spin { font-size:11px; margin-top:4px; }
+.idea .why b, .idea .spin b { font-size:9px; letter-spacing:.1em; opacity:.62; margin-right:4px; }
+.idea .who { display:flex; gap:8px; align-items:center; font-size:11px; font-style:italic; opacity:.8; margin-top:6px; }
+.block-ideas { background:var(--paper); }
+.sparks { display:grid; gap:0; border:var(--rule); margin-bottom:20px; }
+.spark { padding:10px 12px; border-bottom:1px solid var(--ink); }
+.spark:last-child { border-bottom:none; }
+.spark .tech { font-size:9px; letter-spacing:.12em; text-transform:uppercase; font-weight:700; }
+.spark .body { font-family:var(--sans); font-weight:900; font-size:15px; line-height:1.2; text-transform:uppercase; margin:4px 0; }
+.spark .meta { font-size:12px; line-height:1.45; }
+.spark .meta b { font-size:9px; letter-spacing:.1em; opacity:.62; margin-right:4px; }
 .signal { padding:6px 16px; border-bottom:1px solid var(--ink); font-size:12px; display:grid; grid-template-columns:26px 1fr; gap:10px; }
 .signal .cat { font-size:10px; text-transform:uppercase; letter-spacing:.08em; font-weight:700; }
 
@@ -557,9 +630,9 @@ window.oxm = window.oxm || {};
   }
   oxm.mic = {
     active: false, ws: null, audio: null,
-    async start() {
+    async start(path) {
       try {
-        const ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/oxm/audio');
+        const ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + (path || '/oxm/audio'));
         ws.binaryType = 'arraybuffer';
         ws.onclose = (ev) => { if (this.active) { this.active = false; this._teardown(); emitEvent('oxm_mic', {state: 'closed', code: ev.code}); } };
         this.ws = ws;
@@ -621,8 +694,6 @@ window.oxm = window.oxm || {};
     rec.disabled = s.source === 'text';
     $('oxm-source').value = s.source;
     $('oxm-lang').value = s.lang;
-    $('oxm-chips').classList.toggle('hidden', s.source !== 'browser' && s.source !== 'text');
-    document.querySelectorAll('#oxm-chips .spk').forEach((c) => c.classList.toggle('sel', c.dataset.spk === s.speaker));
     $('oxm-feed').classList.toggle('hidden', s.source !== 'text');
     $('oxm-stream').textContent = s.streaming ? '■ STOP' : '▶ STREAM';
     $('f-model').textContent = s.model;
@@ -845,7 +916,7 @@ def highlight(text: str, flags: List[Any]) -> str:
 def render_transcript() -> str:
     if not S.segs:
         return ('<p class="empty">PRESS ● REC AND SPEAK, OR SWITCH THE SOURCE TO TEXT AND STREAM A TRANSCRIPT. '
-                'IN BROWSER-MIC MODE, CLICK A SPEAKER BADGE IN THE HEADER WHEN THE SPEAKER CHANGES.</p>')
+                'SPEAKERS ARE DETECTED AUTOMATICALLY FROM THEIR VOICES.</p>')
     res = results_by_uid()
     rows = []
     for s in S.segs[-300:]:
@@ -889,6 +960,7 @@ def render_overall() -> str:
                 'IT PROFILES EACH SPEAKER, THE DYNAMICS BETWEEN THEM AND WHAT NOBODY SAYS.</p>')
     else:
         cards = (f'<div class="ov-card wide"><h3>NEXT MOVE</h3><p>{e(syn.recommendation)}</p></div>'
+                 f'<div class="ov-card" style="grid-column:1 / -1;border-right:none"><h3>IDEA TO BET ON</h3><p>{e(syn.idea_bet or "—")}</p></div>'
                  f'<div class="ov-card"><h3>DYNAMICS</h3><p>{e(syn.dynamics)}</p></div>'
                  f'<div class="ov-card"><h3>UNDERCURRENT</h3><p>{e(syn.undercurrent or "—")}</p></div>'
                  f'<div class="ov-card"><h3>RISKS</h3><p>{e(syn.risks or "—")}</p></div>'
@@ -896,6 +968,12 @@ def render_overall() -> str:
         tells = "".join(f'<li>{badge(t.who)}<div><q>{e(t.quote)}</q><div class="pat">{e(t.pattern)}</div></div></li>'
                         for t in syn.tells)
         tells_html = f'<h3 class="ov-sub">TELLS</h3><ul class="tells">{tells}</ul>' if tells else ""
+        sparks = "".join(
+            f'<div class="spark"><div class="tech">{e(sp.technique)} · AGAINST: {e(sp.problem)}</div>'
+            f'<p class="body">{e(sp.spark)}</p>'
+            f'<p class="meta"><b>BUILDS ON</b>{e(sp.builds_on)}</p><p class="meta"><b>FIRST TEST</b>{e(sp.first_test)}</p></div>'
+            for sp in syn.sparks)
+        sparks_html = f'<h3 class="ov-sub">NEW IDEAS FROM THIS CONVERSATION</h3><div class="sparks">{sparks}</div>' if sparks else ""
         spk = []
         for p in syn.speakers:
             fields = [("EVIDENCE", p.evidence), ("STATE", p.state), ("MOTIVES", p.motives), ("DEFENCES", p.defenses),
@@ -905,7 +983,7 @@ def render_overall() -> str:
                 dl += f'<dt>BOTTOM LINE</dt><dd class="bottom">{e(p.bottom_line)}</dd>'
             spk.append(f'<div class="ov-spk">{badge(p.label)}<div><div class="role">{e(p.label)} · {e(p.role)}</div><dl>{dl}</dl></div></div>')
         body = (f'<h2 class="ov-headline">{e(syn.headline)}</h2><p class="ov-lead">{e(syn.situation)}</p>'
-                f'<div class="ov-grid">{cards}</div>{tells_html}'
+                f'<div class="ov-grid">{cards}</div>{sparks_html}{tells_html}'
                 f'<h3 class="ov-sub">SPEAKERS</h3><div class="ov-speakers">{"".join(spk)}</div>')
     busy = " busy" if a and a.synth_running else ""
     return f'{head_html}{rel_html}<div class="ov-scroll"><div class="overall{busy}">{body}</div></div>'
@@ -1013,21 +1091,19 @@ def render_side() -> str:
     spk_html = f'<ul class="speakers">{"".join(spk_rows)}</ul>' if spk_rows else '<p class="empty">NO SPEAKERS YET.</p>'
     blocks.append(f'<div class="block"><div class="panel-head"><span>SPEAKERS</span><span class="muted">{len(stats)}</span></div>{spk_html}</div>')
 
-    # signals
-    flags = [(r.speaker_id, f) for r in analysed for f in r.insight.flags][-6:]
-    sig = "".join(f'<li class="signal">{badge(s)}<div><div class="cat">{e(f.category)} · {e(f.severity)}</div>'
-                  f'<q>{e(f.phrase)}</q><div class="muted">{e(f.reason)}</div></div></li>' for s, f in reversed(flags))
-    blocks.append(f'<div class="block"><div class="panel-head"><span>SIGNALS</span><span class="muted">{len(flags)}</span></div>'
-                  + (f'<ul class="signals">{sig}</ul>' if sig else '<p class="empty">NOTHING FLAGGED.</p>') + '</div>')
-
-    # ideas
+    # ideas (shown right under the next move)
     ideas = [(r.speaker_id, i) for r in analysed for i in r.insight.ideas]
     ideas.sort(key=lambda x: -x[1].novelty)
-    idea_rows = "".join(f'<li class="idea"><div class="novelty">{i.novelty}<small>NOVELTY</small></div><div><div>{e(i.idea)}</div>'
-                        f'<div class="why">{e(i.why)} · {e(s)}</div><div class="spin">↳ {e(i.spin)}</div></div></li>'
-                        for s, i in ideas[:6])
-    blocks.append(f'<div class="block"><div class="panel-head"><span>IDEAS</span><span class="muted">{len(ideas)}</span></div>'
-                  + (f'<ul class="ideas">{idea_rows}</ul>' if idea_rows else '<p class="empty">NO REAL IDEAS YET.</p>') + '</div>')
+    idea_rows = "".join(
+        f'<li class="idea"><div class="novelty">{i.novelty}<small>NOVELTY</small></div><div>'
+        f'<div class="idea-text">{e(i.idea)}</div>'
+        f'<div class="why"><b>NEW BECAUSE</b> {e(i.why)}</div>'
+        f'<div class="spin"><b>PUSHED FURTHER</b> {e(i.spin)}</div>'
+        f'<div class="who">{badge(s)}<q>{e(i.source)}</q></div></div></li>'
+        for s, i in ideas[:8])
+    blocks.insert(1, f'<div class="block block-ideas"><div class="panel-head"><span>IDEAS</span><span class="muted">{len(ideas)} RAISED</span></div>'
+                  + (f'<ul class="ideas">{idea_rows}</ul>' if idea_rows else
+                     '<p class="empty">NO REAL IDEAS YET. A PROPOSAL THAT CHANGES HOW SOMETHING IS DONE SHOWS UP HERE.</p>') + '</div>')
     return "".join(blocks)
 
 
@@ -1038,7 +1114,9 @@ def header_state() -> Dict[str, Any]:
     err = S.error or (a.last_error if a else "") or (S.engine.last_error if S.engine else "")
     if a and a.budget.spent >= a.budget.limit:
         err = f"BUDGET OF ${a.budget.limit:.0f} REACHED"
-    if err:
+    if S.status_note:
+        status = S.status_note
+    elif err:
         status = "ERROR · " + err
     elif S.recording:
         status = "LISTENING · " + SOURCES[S.source]
@@ -1046,7 +1124,7 @@ def header_state() -> Dict[str, Any]:
         status = "STREAMING TEXT"
     else:
         status = "READY · " + SOURCES[S.source]
-    level = -1 if S.source in ("dg_mic", "browser") else 0
+    level = -1 if S.source in ("dg_mic", "auto") else 0
     if S.engine is not None:
         level = min(100, int(S.engine.level * 2000))
     elif S.raw is not None:
@@ -1055,7 +1133,7 @@ def header_state() -> Dict[str, Any]:
     dg = S.dg_cost + (S.dg.cost if S.dg else 0.0)
     return {
         "status": status, "err": bool(err), "live": S.recording or bool(S.feed_task),
-        "recording": S.recording, "source": S.source, "lang": S.lang, "speaker": S.speaker,
+        "recording": S.recording, "source": S.source, "lang": S.lang,
         "streaming": bool(S.feed_task),
         "model": S.provider.label if S.provider else "—",
         "latency": f"LATENCY {last.latency_s:.1f} S" if last else "LATENCY —",
@@ -1075,7 +1153,11 @@ def export_markdown() -> str:
     syn = a.synthesis if a else None
     if syn:
         lines += [f"## {syn.headline}", "", syn.situation, "", f"**Next move:** {syn.recommendation}", "",
-                  f"**Dynamics:** {syn.dynamics}", "", f"**Undercurrent:** {syn.undercurrent}", "", f"**Risks:** {syn.risks}", ""]
+                  f"**Idea to bet on:** {syn.idea_bet}", "", f"**Dynamics:** {syn.dynamics}", "", f"**Undercurrent:** {syn.undercurrent}", "", f"**Risks:** {syn.risks}", ""]
+        if syn.sparks:
+            lines += ["### New ideas from this conversation", ""] + [
+                f"- **{sp.spark}** ({sp.technique}, against: {sp.problem}). Builds on {sp.builds_on}. First test: {sp.first_test}"
+                for sp in syn.sparks] + [""]
         if syn.tells:
             lines += ["### Tells", ""] + [f"- **{t.who}:** \"{t.quote}\" — {t.pattern}" for t in syn.tells] + [""]
         lines += ["### Speakers", ""]
@@ -1108,7 +1190,7 @@ async def run_feed(text: str, wpm: int) -> None:
             if not raw.strip():
                 continue
             m = pattern.match(raw)
-            speaker, line = (m.group(1).strip(), m.group(2)) if m else (S.speaker, raw)
+            speaker, line = (m.group(1).strip(), m.group(2)) if m else ("Speaker 1", raw)
             await asyncio.sleep(max(0.4, len(line.split()) / max(30, wpm) * 60))
             ingest(speaker, line)
     finally:
@@ -1121,8 +1203,6 @@ async def run_feed(text: str, wpm: int) -> None:
 def header_html() -> str:
     src = "".join(f'<option value="{k}">{e(v)}</option>' for k, v in SOURCES.items())
     langs = "".join(f'<option value="{k}">{LANG_LABEL.get(k, k.upper())}</option>' for k in LANGS)
-    chips = "".join(f'<span class="spk spk-{i}" data-spk="{c}" title="Current speaker {c}" onclick="oxm.cmd(\'speaker\',\'{c}\')">{c}</span>'
-                    for i, c in enumerate("ABCD"))
     return f"""
 <header class="bar">
   <h1>0X<br>MOIRA</h1>
@@ -1130,7 +1210,6 @@ def header_html() -> str:
   <div class="controls">
     <label>SOURCE <select id="oxm-source" onchange="oxm.cmd('source', this.value)">{src}</select></label>
     <label>LANGUAGE <select id="oxm-lang" onchange="oxm.cmd('lang', this.value)">{langs}</select></label>
-    <span class="chips" id="oxm-chips" title="Who is speaking now (browser mic has no speaker separation)">{chips}</span>
     <button class="btn btn-rec" id="oxm-rec" onclick="oxm.cmd('rec')">● REC</button>
     <button class="btn" onclick="oxm.cmd('export')">EXPORT</button>
     <button class="btn" onclick="oxm.cmd('clear')">CLEAR</button>
@@ -1216,16 +1295,18 @@ def index() -> None:
             if cmd == "rec":
                 if S.recording:
                     await stop_recording()
-                elif S.source == "browser":
-                    S.recording, S.rec_client, S.error = True, client_id, ""
+                elif S.source == "auto":
+                    S.error = ""
+                    await prepare_voice()
+                    S.recording, S.rec_client = True, client_id
                     sp_lang = "en-US" if S.lang == "multi" else S.lang
-                    ui.run_javascript(f"oxm.speech.start({json.dumps(sp_lang)})")
+                    ui.run_javascript(f"oxm.speech.start({json.dumps(sp_lang)}); oxm.mic.start('/oxm/voice')")
                 elif S.source == "dg_mic":
                     if not S.deepgram_key:
                         raise RuntimeError("Deepgram needs an API key: sign out and add one on the sign-in screen.")
                     S.error, S.rec_client = "", client_id
                     S.recording = True
-                    ui.run_javascript("oxm.mic.start()")
+                    ui.run_javascript("oxm.mic.start('/oxm/audio')")
                 elif S.source == "dg_system":
                     S.error = ""
                     await start_dg_system()
@@ -1240,16 +1321,14 @@ def index() -> None:
                 S.source = value
             elif cmd == "lang" and value in LANGS:
                 S.lang = value
-                if S.recording and S.source == "browser":
+                if S.recording and S.source == "auto":
                     sp_lang = "en-US" if value == "multi" else value
                     ui.run_javascript(f"oxm.speech.stop(); oxm.speech.start({json.dumps(sp_lang)})")
                 elif S.recording and S.source == "dg_mic":
                     await stop_dg()
-                    ui.run_javascript("oxm.mic.stop(); setTimeout(() => oxm.mic.start(), 300)")
+                    ui.run_javascript("oxm.mic.stop(); setTimeout(() => oxm.mic.start('/oxm/audio'), 300)")
                 elif S.recording and S.source == "dg_system":
                     await start_dg_system()
-            elif cmd == "speaker" and isinstance(value, str):
-                S.speaker = value
             elif cmd == "analyse":
                 if S.agent and not S.agent.request_synthesis():
                     ui.notify("Nothing to analyse yet, or an analysis is already running.")
@@ -1281,7 +1360,9 @@ def index() -> None:
     def on_final(ev: Any) -> None:
         args = event_args(ev)
         conf = args.get("confidence") or 0
-        ingest(S.speaker, str(args.get("text", "")), int(conf * 100) if conf else None)
+        text = str(args.get("text", "")).strip()
+        if text:
+            asyncio.create_task(auto_ingest(text, int(conf * 100) if conf else None, time.monotonic()))
 
     def on_speech_error(ev: Any) -> None:
         err = event_args(ev).get("error", "unknown")
@@ -1291,7 +1372,7 @@ def index() -> None:
             S.error = "Microphone or speech recognition was blocked in the browser."
         else:
             S.error = f"Speech recognition: {err}"
-        if err in ("not-supported", "not-allowed", "service-not-allowed") or S.source == "dg_mic":
+        if err in ("not-supported", "not-allowed", "service-not-allowed") or S.source in ("dg_mic", "auto"):
             S.recording = False
 
     ui.on("oxm_cmd", on_cmd)
@@ -1299,7 +1380,7 @@ def index() -> None:
     ui.on("oxm_speech_error", on_speech_error)
 
     def on_mic(ev: Any) -> None:
-        if event_args(ev).get("state") == "closed" and S.source == "dg_mic" and S.recording:
+        if event_args(ev).get("state") == "closed" and S.source in ("dg_mic", "auto") and S.recording:
             S.recording = False
             if not S.error:
                 S.error = "Live transcription connection closed. Press REC to reconnect."
