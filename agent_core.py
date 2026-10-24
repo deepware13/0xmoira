@@ -124,6 +124,18 @@ Lines tagged `(transcript confidence N %, UNRELIABLE)` and garbled passages are 
 - Never output internal codes (`defense`, `probe_question`); say it in words."""
 
 
+ASK_SYSTEM_PROMPT = """You are Oxmoira, a real-time meeting copilot. The user is sitting in the meeting and asks you a question about it. Answer from the transcript (and your latest overall assessment, if given) like a sharp, discreet adviser whispering in their ear.
+
+- Max 80 words. Lead with the answer, then the evidence: quote short phrases from the transcript with the speaker.
+- If the transcript does not support an answer, say so in one sentence and say what to listen or ask for instead.
+- Be direct about observable behaviour; hedge inferences about inner motives once ("probably").
+- No psychiatric or medical diagnoses; nothing derived from gender, origin, age, accent or dialect. No manipulation advice.
+- Answer in the language of the question. Respond only with JSON matching the schema."""
+
+ASK_SCHEMA: Dict[str, Any] = {"type": "object", "properties": {"answer": {"type": "string"}},
+                              "required": ["answer"], "additionalProperties": False}
+
+
 def _score_prop(lo: int = 0, hi: int = 100) -> Dict[str, Any]:
     return {"type": "integer", "minimum": lo, "maximum": hi}
 
@@ -473,6 +485,7 @@ class AgentCore:
         self.window: Deque[Dict[str, Any]] = deque(maxlen=WINDOW_SIZE)
         self.transcript: Deque[Tuple[str, str, bool]] = deque(maxlen=TRANSCRIPT_KEEP)
         self.speaker_stats: Dict[str, SpeakerStats] = {}
+        self.names: Dict[str, str] = {}      # speaker label -> name given by the user (shared with the UI)
         self.synthesis: Optional[Synthesis] = None
         self.synth_history: List[Synthesis] = []
         self.synth_version = 0
@@ -499,6 +512,18 @@ class AgentCore:
             self.inbox.put_nowait(ASRPayload(**raw))
         except (ValidationError, TypeError) as exc:
             log.error("Bad ASR payload %r: %s", raw, exc)
+
+    async def ask(self, question: str) -> Tuple[Optional[str], float, str]:
+        """Free question about the meeting so far. Returns (answer, cost, error)."""
+        lines = "\n".join(f"[{self._n(sp)}] {t}" for sp, t, _ in self.transcript)[-SYNTH_MAX_CHARS:]
+        syn = ""
+        if self.synthesis is not None:
+            syn = (f"\n\nLATEST OVERALL ASSESSMENT:\n{self.synthesis.headline}\n{self.synthesis.situation}\n"
+                   f"Dynamics: {self.synthesis.dynamics}\nUndercurrent: {self.synthesis.undercurrent}")
+        msg = f"TRANSCRIPT:\n<<<\n{lines or '(nothing said yet)'}\n>>>{syn}\n\nQUESTION: {question.strip()[:500]}"
+        self.budget.check(self._worst_case(ASK_SYSTEM_PROMPT, msg, 2000))
+        return await self._json_call(ASK_SYSTEM_PROMPT, ASK_SCHEMA, msg, 4000, "low",
+                                     lambda d: str(d["answer"]).strip())
 
     def request_synthesis(self) -> bool:
         """Manual trigger (e.g. a UI button). Returns False if one is already running or there is no material."""
@@ -566,10 +591,12 @@ class AgentCore:
             st.unreliable += 1
         return entry
 
-    @staticmethod
-    def _line(speaker: str, text: str, confidence: Optional[int], unreliable: bool) -> str:
+    def _n(self, label: str) -> str:
+        return self.names.get(label) or label
+
+    def _line(self, speaker: str, text: str, confidence: Optional[int], unreliable: bool) -> str:
         tag = f" (transcript confidence {confidence} %, UNRELIABLE)" if unreliable else ""
-        return f"[{speaker}]{tag} {text}"
+        return f"[{self._n(speaker)}]{tag} {text}"
 
     def _render_window(self) -> str:
         lines: List[str] = []
@@ -584,9 +611,9 @@ class AgentCore:
     def _baseline(self, speaker: str) -> str:
         st = self.speaker_stats.get(speaker)
         if st is None or st.n < 2:
-            return f"BASELINE for {speaker}: none yet ({0 if st is None else st.n} analysed utterances)."
+            return f"BASELINE for {self._n(speaker)}: none yet ({0 if st is None else st.n} analysed utterances)."
         e = st.ema
-        return (f"BASELINE for {speaker} ({st.n} analysed utterances, smoothed): tension {e['cognitive_tension_score']:.1f}/10, "
+        return (f"BASELINE for {self._n(speaker)} ({st.n} analysed utterances, smoothed): tension {e['cognitive_tension_score']:.1f}/10, "
                 f"stress {e['stress']:.0f}, defensiveness {e['defensiveness']:.0f}, agitation {e['agitation']:.0f}, "
                 f"confidence {e['confidence']:.0f}, dominance {e['dominance']:.0f}, coherence {e['coherence']:.0f}.")
 
@@ -665,7 +692,7 @@ class AgentCore:
 
     # ---- periodic synthesis -------------------------------------------------
     def _synth_input(self) -> Tuple[str, List[str], int]:
-        lines = [f"[{s}]{' (UNRELIABLE)' if u else ''} {t}" for s, t, u in self.transcript]
+        lines = [f"[{self._n(s)}]{' (UNRELIABLE)' if u else ''} {t}" for s, t, u in self.transcript]
         transcript = "\n".join(lines)
         if len(transcript) > SYNTH_MAX_CHARS:
             transcript = "(earlier lines omitted)\n" + transcript[-SYNTH_MAX_CHARS:].split("\n", 1)[-1]
@@ -682,7 +709,7 @@ class AgentCore:
                        f"agitation {e['agitation']:.0f}, confidence {e['confidence']:.0f}, dominance {e['dominance']:.0f}, "
                        f"coherence {e['coherence']:.0f}") if e else "no metrics yet"
             unrel = f", {st.unreliable} unreliable lines" if st.unreliable else ""
-            roster_lines.append(f"- {lab}: {st.words} words{unrel}; smoothed metrics: {metrics}{thin}")
+            roster_lines.append(f"- {self._n(lab)}: {st.words} words{unrel}; smoothed metrics: {metrics}{thin}")
 
         flags: List[str] = []
         ideas: List[Tuple[int, str]] = []
@@ -690,9 +717,9 @@ class AgentCore:
             if r.insight is None:
                 continue
             for f in r.insight.flags:
-                flags.append(f"[{r.speaker_id}] {f.category}/{f.severity}: \"{f.phrase}\" ({f.reason})")
+                flags.append(f"[{self._n(r.speaker_id)}] {f.category}/{f.severity}: \"{f.phrase}\" ({f.reason})")
             for i in r.insight.ideas:
-                ideas.append((i.novelty, f"[{r.speaker_id}] \"{i.source}\" -> {i.idea} (novelty {i.novelty})"))
+                ideas.append((i.novelty, f"[{self._n(r.speaker_id)}] \"{i.source}\" -> {i.idea} (novelty {i.novelty})"))
         ideas.sort(key=lambda x: -x[0])
 
         prev = "(none: this is the first assessment)"
@@ -733,8 +760,10 @@ class AgentCore:
                         prof = SpeakerProfile(**item)
                     except (ValidationError, TypeError):
                         continue
-                    if prof.label not in labels:
+                    by_name = {self._n(lab): lab for lab in labels}
+                    if prof.label not in labels and prof.label not in by_name:
                         continue
+                    prof.label = by_name.get(prof.label, prof.label)   # back to the internal label
                     st = self.speaker_stats.get(prof.label)
                     if st is not None and st.words < MIN_PROFILE_WORDS:   # enforced in code, not only in the prompt
                         for f in _PROFILE_FIELDS[1:]:

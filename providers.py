@@ -104,7 +104,13 @@ def strict_schema(schema: Any) -> Any:
         return [strict_schema(s) for s in schema]
     if not isinstance(schema, dict):
         return schema
-    out = {k: strict_schema(v) for k, v in schema.items() if k not in _UNSUPPORTED}
+    out = {}
+    for k, v in schema.items():
+        if k == "properties" and isinstance(v, dict):
+            # property NAMES are user data (e.g. a field called "pattern"), not schema keywords
+            out[k] = {name: strict_schema(sub) for name, sub in v.items()}
+        elif k not in _UNSUPPORTED:
+            out[k] = strict_schema(v)
     if out.get("type") == "object" and "properties" in out:
         out["additionalProperties"] = False
         out["required"] = list(out["properties"].keys())
@@ -144,6 +150,9 @@ async def verify_anthropic(api_key: str) -> List[str]:
     return ids
 
 
+FAST_ANTHROPIC_MODEL = "claude-haiku-5-5"
+
+
 def default_anthropic_model(ids: List[str]) -> str:
     if DEFAULT_ANTHROPIC_MODEL in ids:
         return DEFAULT_ANTHROPIC_MODEL
@@ -154,15 +163,18 @@ def default_anthropic_model(ids: List[str]) -> str:
 class AnthropicProvider:
     name = "anthropic"
 
-    def __init__(self, api_key: str, model: str) -> None:
+    def __init__(self, api_key: str, model: str, live_model: str = "") -> None:
         self.model = model
+        self.live_model = live_model or model   # model for the per-sentence live reads
         self.client = anthropic.AsyncAnthropic(api_key=api_key, max_retries=2, timeout=60.0)
         self._fallbacks = model in FALLBACK_MODELS
         self._effort = True
-        self._thinking_off = THINKING_OFF.get(model)
+        self._thinking_off = THINKING_OFF.get(self.live_model)
 
     @property
     def label(self) -> str:
+        if self.live_model != self.model:
+            return f"ANTHROPIC · LIVE {self.live_model} · OVERALL {self.model}"
         return f"ANTHROPIC · {self.model}"
 
     def price_in_out(self) -> Tuple[float, float]:
@@ -184,7 +196,7 @@ class AnthropicProvider:
         if self._effort:
             output_config["effort"] = effort
         kwargs: Dict[str, Any] = dict(
-            model=self.model,
+            model=self.live_model if fast else self.model,
             max_tokens=max_tokens,
             system=[{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
             messages=[{"role": "user", "content": user_msg}],
@@ -210,7 +222,7 @@ class AnthropicProvider:
                 self._thinking_off = None
                 return await self.json_call(system, schema, user_msg, max_tokens, effort, fast)
             raise
-        cost = self._cost(getattr(msg, "model", self.model) or self.model, msg.usage)
+        cost = self._cost(getattr(msg, "model", None) or kwargs["model"], msg.usage)
         if msg.stop_reason == "refusal":
             return None, cost, "model declined (refusal)"
         if msg.stop_reason == "max_tokens":

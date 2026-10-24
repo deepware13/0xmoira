@@ -36,9 +36,12 @@ MODEL_URL = (f"https://huggingface.co/Wespeaker/wespeaker-voxceleb-resnet34-LM/r
 MODEL_SHA256 = "7bb2f06e9df17cdf1ef14ee8a15ab08ed28e8d0ef5054ee135741560df2ec068"
 MODEL_PATH = CRED_DIR / "models" / "voxceleb_resnet34_LM.onnx"
 
-SIM_THRESHOLD = 0.41      # min average-linkage cosine similarity to be the same speaker
+# ResNet34 in simulated rooms (RT60 0.3-0.8 s, SNR 8-20 dB, 1.5-3.5 s segments): same speaker 0.52 +- 0.12,
+# different speakers 0.16 +- 0.11. 0.41 split 4 voices into 7. Streaming tests with constant room noise: 0.32 merged
+# two similar voices in 4/4 runs, 0.36 in 3/4, 0.38 in 1/4; none over-split. 0.36 errs towards fewer speakers.
+SIM_THRESHOLD = 0.36      # min average-linkage cosine similarity to be the same speaker
 MIN_RELIABLE_S = 1.5      # shorter segments never found a speaker of their own
-MIN_CLUSTER_S = 3.0       # a group with less speech is provisional and folded into the nearest one
+MIN_CLUSTER_S = 5.0       # a new voice needs this much speech before it becomes a speaker of its own
 HYSTERESIS = 0.08         # an unsure segment switches speaker only if clearly closer to another
 WINDOW = 500              # segments re-clustered (older ones keep their label)
 
@@ -138,10 +141,13 @@ class VoiceDiarizer:
     items: List[Item] = field(default_factory=list)
     used: List[str] = field(default_factory=list)
     next_id: int = 0
-
+    max_speakers: int = 0     # 0 = automatic
     def _new_label(self, taken: set) -> str:
+        # Lowest free number: a provisional voice that was later merged away gives its number back,
+        # so speakers are numbered 1, 2, 3 without gaps. Labels of segments outside the window stay reserved.
+        frozen = {x.label for x in self.items[:-WINDOW] if x.label}
         k = 1
-        while f"Speaker {k}" in taken or f"Speaker {k}" in self.used:
+        while f"Speaker {k}" in taken or f"Speaker {k}" in frozen:
             k += 1
         return f"Speaker {k}"
 
@@ -161,8 +167,14 @@ class VoiceDiarizer:
         items = self.items[-WINDOW:]
         reliable = [x for x in items if x.dur >= MIN_RELIABLE_S] or [max(items, key=lambda x: x.dur)]
         X = np.stack([x.emb for x in reliable])
-        groups = np.array([1]) if len(reliable) == 1 else fcluster(
-            linkage(X, method="average", metric="cosine"), t=1.0 - SIM_THRESHOLD, criterion="distance")
+        if len(reliable) == 1:
+            groups = np.array([1])
+        else:
+            with np.errstate(all="ignore"):
+                Z = linkage(X, method="average", metric="cosine")
+            groups = fcluster(Z, t=1.0 - SIM_THRESHOLD, criterion="distance")
+            if self.max_speakers > 0 and groups.max() > self.max_speakers:
+                groups = fcluster(Z, t=self.max_speakers, criterion="maxclust")
         durs = np.array([x.dur for x in reliable])
         secs = {g: float(durs[groups == g].sum()) for g in set(groups.tolist())}
         big = [g for g, v in secs.items() if v >= MIN_CLUSTER_S]
@@ -177,7 +189,8 @@ class VoiceDiarizer:
         ids = sorted(set(groups.tolist()))
         cents = np.stack([_norm(X[groups == g].mean(0)) for g in ids])
         E = np.stack([x.emb for x in items])
-        S = E @ cents.T
+        with np.errstate(all="ignore"):
+            S = E @ cents.T
         member = {id(x): ids.index(g) for x, g in zip(reliable, groups)}
         unsure = {id(x) for x, p in zip(reliable, provisional) if p}
         assign = np.array([member.get(id(x), int(np.argmax(S[i]))) for i, x in enumerate(items)])
@@ -227,7 +240,7 @@ class VoiceTracker:
         self._carry = np.zeros(0, dtype=np.float32)
         self._ring: List[np.ndarray] = []
         self._active: List[np.ndarray] = []
-        self._noise = 0.004
+        self._rms_hist: List[float] = []   # last ~10 s of frame energies, for a robust noise floor
         self._silence = 0
         self._voiced = 0
         self._t_start = 0.0
@@ -250,10 +263,15 @@ class VoiceTracker:
             t = now - (n - i) * FRAME / SR
             rms = float(np.sqrt(np.mean(frame * frame)) + 1e-12)
             self.level = rms
-            speech = rms >= max(0.006, self._noise * 3.0)
+            # Noise floor = 5th percentile of the last 10 s, updated on every frame. Unlike a floor that only
+            # learns during silence, it cannot get stuck when the room is louder than the initial guess; the
+            # long window keeps it from rising into the speech level during a long uninterrupted turn.
+            self._rms_hist.append(rms)
+            if len(self._rms_hist) > 333:
+                self._rms_hist.pop(0)
+            floor = float(np.percentile(self._rms_hist, 5)) if len(self._rms_hist) >= 10 else 0.002
+            speech = rms >= max(0.004, floor * 2.5)
             if self.open_since is None:
-                if not speech:
-                    self._noise = 0.95 * self._noise + 0.05 * rms
                 self._ring = (self._ring + [frame])[-PREROLL_FRAMES:]
                 if speech:
                     self._active, self._ring = list(self._ring), []
@@ -310,12 +328,21 @@ class VoiceTracker:
         ids: List[int] = []
         for it in self.diar.items[-60:]:
             o = min(hi, it.t1) - max(lo, it.t0)
-            if it.label and o > 0 and (o >= 0.4 * it.dur or o >= 1.0):
+            if it.label and o > 0 and (o >= 0.4 * it.dur or o >= 0.5):
                 overlap[it.label] = overlap.get(it.label, 0.0) + o
                 ids.append(it.id)
         if overlap:
             return max(overlap, key=overlap.get), ids
         return self.last_label or "Speaker 1", ids
+
+    def set_max_speakers(self, n: int) -> None:
+        self.diar.max_speakers = max(0, int(n))
+        if self.diar.items:
+            before = {x.id: x.label for x in self.diar.items}
+            self.diar._recluster()
+            changed = [x for x in self.diar.items if before.get(x.id) and before[x.id] != x.label]
+            if changed and self.on_relabel:
+                self.on_relabel(changed)
 
     def label_of(self, ids: Sequence[int]) -> Optional[str]:
         by_id = {it.id: it for it in self.diar.items[-WINDOW:]}

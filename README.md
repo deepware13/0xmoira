@@ -23,6 +23,8 @@ The design rests on three principles:
 - **Verification against the transcript.** Every quoted phrase, idea and "tell" is checked against what was actually said; anything that can't be found is discarded.
 - **Calibration against each speaker's own baseline.** A habitually blunt speaker is not scored as agitated for being blunt.
 
+A third layer lets the user **ask** the meeting questions in plain language ("What does Jonas really want?") and get an answer grounded in quotes within about three seconds.
+
 The system runs locally as a single asyncio process with a browser interface. It uses Anthropic Claude or Google Gemini for reasoning and Deepgram for streaming speech recognition with speaker separation (diarization).
 
 ---
@@ -128,12 +130,19 @@ with $r_{\min}=0.006$ and $k=3$. A turn ends after 450 ms of silence or 8 s of s
 
 In **auto** mode the browser's speech recognition produces the text, and the same microphone stream goes to the app over a WebSocket. There:
 
-1. An energy-based voice activity detector cuts voiced segments (250 ms of silence ends a segment; 6 s maximum).
+1. An energy-based voice activity detector cuts voiced segments (250 ms of silence ends a segment; 6 s maximum). Its noise floor is the 5th percentile of frame energy over the last 10 s, updated on every frame, so a loud room cannot lock it in the "always speech" state.
 2. Each segment gets a 256-dimensional voice print from **WeSpeaker ResNet34-LM** (ONNX, CPU, about 70 ms per segment; CC BY 4.0; downloaded once, 26 MB, pinned by commit and SHA-256). Features are 80-bin Kaldi log-mel filterbanks with mean normalisation; the filterbank matches the prototype's reference matrix exactly.
-3. After every new segment, all segments of the session are re-clustered: agglomerative, average linkage, cosine distance, threshold 0.41. Segments under 1.5 s cannot found a speaker of their own; groups under 3 s of speech are folded into the nearest established speaker. Labels stay stable through Hungarian matching on speaking time. When the clustering revises an earlier segment, the matching transcript line is relabelled in place.
+3. After every new segment, all segments of the session are re-clustered: agglomerative, average linkage, cosine distance, threshold 0.36. Segments under 1.5 s cannot found a speaker of their own; groups under 5 s of speech are folded into the nearest established speaker, so a new person appears only after they have said a few sentences. An optional **SPEAKERS** setting (AUTO, 2–6) caps the count when it is known. Labels stay stable through Hungarian matching on speaking time. When the clustering revises an earlier segment, the matching transcript line is relabelled in place.
 4. A finished transcript line is assigned to the speaker with the most voiced time inside the window it was most likely spoken in: [t_final − 1.2 s − words/4 s, t_final + 0.3 s].
 
-**Test.** A scripted conversation with four synthetic voices (macOS Daniel, Karen, Moira, Tessa), 12 turns, 0.35 s pauses: all 12 turns got the correct speaker. Same-voice cosine similarity was 0.87 ± 0.03; different voices 0.19 ± 0.09, at most 0.35. Synthetic voices from the same synthesis engine scored up to 0.86 against each other and could not be separated, so real voices in real rooms need their own evaluation (§10).
+**Tests.** A scripted conversation with four synthetic voices (macOS Daniel, Karen, Moira, Tessa), 12 turns, 0.35 s pauses.
+
+| Condition | Result |
+|---|---|
+| Clean audio | 12/12 turns correct, 4 speakers. Same voice: cosine 0.87 ± 0.03; different voices: 0.19 ± 0.09 (max 0.35). |
+| Simulated room: random reverb (RT60 0.3–0.8 s), per-speaker loudness 0.3–0.9, constant noise; 1.5–3.5 s segments | Same voice drops to 0.52 ± 0.12; different voices 0.16 ± 0.11. The first threshold (0.41) split 4 people into 7, matching a user report from a real room. At 0.36: no over-splitting in 4 runs; in 3 of 4 runs two similar female voices (Moira, Tessa, only 2 turns) were merged. |
+
+The detector therefore errs towards fewer speakers. Synthetic voices from the same synthesis engine scored up to 0.86 against each other and could not be separated. Real voices in real rooms need their own evaluation (§10).
 
 ### 3.2 Live read
 
@@ -199,13 +208,19 @@ $$R = \operatorname{round}\!\Big(100 \cdot \min\big(1, \tfrac{\text{words}}{200}
 
 where $u$ is the share of unreliable turns. $R$ is a heuristic for how much material the assessment rests on. It is **not** a confidence in its correctness.
 
-### 3.6 Back-pressure
+### 3.6 Interaction
+
+- **Ask 0xmoira.** A question box under the overall analysis. The model receives the transcript (with user-given names) and the latest assessment, and answers in at most 80 words, leading with the answer and quoting the evidence.
+- **Naming speakers.** Clicking a speaker in the right column assigns a name. Names are used in all later prompts, the profiles and the export.
+- **Live model split.** Live reads can run on a faster model (default `claude-haiku-5-5`) while synthesis and questions use the main model (default `claude-sonnet-5-5`).
+
+### 3.7 Back-pressure
 
 - **Parallel reads:** up to `OXMOIRA_INFLIGHT = 3` live reads run concurrently.
 - **Backlog collapse:** if more than six turns are waiting, the oldest are added to the context window without being analysed individually. The transcript keeps flowing during fast exchanges, and cost stays bounded.
 - **Short turns:** turns under three words ("okay", "yes") are recorded but not analysed.
 
-### 3.7 Cost control
+### 3.8 Cost control
 
 - **Prompt caching:** the system prompt is about 4.4k tokens and cached with `cache_control: ephemeral`. After the first request, it is billed at the cache-read rate.
 - **Persisted budget:** a budget file refuses new model calls once the projected spend would reach `OXMOIRA_BUDGET_USD` (default $75).
@@ -240,13 +255,18 @@ These frameworks differ widely in empirical support. Psychoanalytic and transact
 
 ## 5. Measured performance
 
-All figures were measured on 2026-10-24 with `claude-sonnet-5-5` on the Anthropic API, on a home internet connection. They are small samples (n = 1–4 requests per condition), so treat them as indicative, not as benchmarks.
+All figures were measured on 2026-10-24 with `claude-sonnet-5-5` and `claude-haiku-5-5` on the Anthropic API, on a home internet connection. They are small samples (n = 1–4 requests per condition), so treat them as indicative, not as benchmarks.
 
 | Condition | Time to first token | Total latency per read | Output tokens | Cost per read |
 |---|---|---|---|---|
 | Live read, thinking on (adaptive, effort `low`). Earlier version, from server logs. | — | ≈ 7–15 s | — | — |
 | Live read, thinking off, single request, warm cache | 1.16 s | **2.95 s** | 300 | ≈ $0.005 |
 | Live read, thinking off, 4 turns submitted at once (3 in flight) | — | 3.4–5.8 s each; all 4 done after 8.4 s | — | $0.005 (cache hit) to $0.014 (cache write) |
+| Live read on `claude-haiku-5-5`, sample meeting (10 turns, 1.5 s apart) | — | **1.9–3.0 s** | — | ≈ $0.0002–0.0007 |
+| Overall synthesis on `claude-sonnet-5-5` (10 turns, adaptive thinking, effort `medium`) | — | 19.1 s (background task) | — | $0.034 |
+| Ask 0xmoira on `claude-sonnet-5-5` | — | 2.9 s | — | $0.004 |
+
+The complete sample meeting (10 live reads, one synthesis, one question) cost **$0.041**.
 
 The 4,383 cached system-prompt tokens were read from cache on warm requests.
 

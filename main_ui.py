@@ -17,7 +17,7 @@ from agent_core import BUDGET_USD, SYNTH_EVERY, AgentCore, AnalysisResult
 from audio_engine import AudioConfig, AudioEngine, RawCapture
 from diarizer import Embedder, VoiceTracker, ensure_model
 from providers import (AnthropicProvider, DeepgramLive, GeminiProvider, GeminiTranscriber, LoginError, clear_credentials,
-                       deepgram_language, verify_deepgram,
+                       deepgram_language, verify_deepgram, FAST_ANTHROPIC_MODEL,
                        default_anthropic_model, default_gemini_model, load_credentials, mask_key,
                        save_credentials, verify_anthropic, verify_gemini)
 
@@ -63,6 +63,10 @@ class State:
     voice: Optional[VoiceTracker] = None
     voice_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     status_note: str = ""
+    names: Dict[str, str] = field(default_factory=dict)     # speaker label -> name given by the user
+    max_speakers: int = 0                                   # 0 = automatic
+    answers: List[Dict[str, Any]] = field(default_factory=list)
+    ask_version: int = 0
     agent: Optional[AgentCore] = None
     engine: Optional[AudioEngine] = None
     pump: Optional[asyncio.Task] = None
@@ -94,7 +98,22 @@ def spk_index(label: str) -> int:
     return S.speaker_order[label] % 6
 
 
+def disp(label: str) -> str:
+    return S.names.get(label) or label
+
+
+def internal(label: str) -> str:
+    for k, v in S.names.items():
+        if v == label:
+            return k
+    return label
+
+
 def spk_short(label: str) -> str:
+    name = S.names.get(label)
+    if name:
+        parts = name.split()
+        return ((parts[0][0] + parts[1][0]) if len(parts) > 1 else name[:2]).upper()
     m = re.fullmatch(r"(?i)speaker[ _-]?(\w+)", label.strip())
     if m:
         return m.group(1)[:2].upper()
@@ -102,7 +121,8 @@ def spk_short(label: str) -> str:
 
 
 def badge(label: str, extra: str = "") -> str:
-    return f'<span class="spk spk-{spk_index(label)} {extra}" title="{e(label)}">{e(spk_short(label))}</span>'
+    label = internal(label)
+    return f'<span class="spk spk-{spk_index(label)} {extra}" title="{e(disp(label))}">{e(spk_short(label))}</span>'
 
 
 # =========================================================================== #
@@ -256,6 +276,7 @@ async def prepare_voice() -> None:
         S.status_note = ""
     if S.voice is None:
         S.voice = VoiceTracker(S.embedder, _on_relabel)
+        S.voice.diar.max_speakers = S.max_speakers
 
 
 async def auto_ingest(text: str, confidence: Optional[int], t_final: float) -> None:
@@ -315,6 +336,10 @@ async def new_session() -> None:
     if S.agent:
         await S.agent.stop()
     S.agent = AgentCore(S.provider)
+    S.names = {}
+    S.answers = []
+    S.ask_version += 1
+    S.agent.names = S.names
     S.agent.start()
     S.spent_start = S.agent.budget.spent
     S.dg_cost = 0.0
@@ -348,11 +373,11 @@ async def sign_out() -> None:
 
 
 async def activate(provider_name: str, key: str, model: str, gemini_key: str = "", gemini_model: str = "",
-                   deepgram_key: str = "") -> None:
+                   deepgram_key: str = "", live_model: str = "") -> None:
     if S.provider is not None:
         await sign_out()
     if provider_name == "anthropic":
-        S.provider = AnthropicProvider(key, model)
+        S.provider = AnthropicProvider(key, model, live_model)
         S.gemini_asr = GeminiProvider(gemini_key, gemini_model) if gemini_key else None
         S.gemini_asr_model = gemini_model
     else:
@@ -535,6 +560,15 @@ h4.sub { font-family:var(--mono); font-weight:400; font-size:9px; letter-spacing
 .ov-spk dd.bottom { font-weight:700; }
 .ov-trend { border-top:var(--rule); padding-top:10px; font-style:italic; font-size:13px; }
 
+.ask { flex:none; border-top:var(--rule); display:flex; flex-direction:column; max-height:42%; }
+.ask-list { overflow-y:auto; padding:8px 24px; display:grid; gap:10px; }
+.ask-list .q { font-size:11px; text-transform:uppercase; letter-spacing:.06em; opacity:.7; }
+.ask-list .a { font-size:14px; line-height:1.5; border-left:4px solid var(--ink); padding-left:10px; }
+.ask-list .a.busy { opacity:.5; font-style:italic; }
+.ask-bar { display:flex; gap:8px; padding:8px 16px 10px; }
+.ask-bar input { flex:1; border:var(--rule); padding:8px 10px; outline:none; border-radius:0; font-size:13px; }
+.speaker .name.rn { cursor:pointer; text-decoration:underline dotted; text-underline-offset:3px; }
+
 /* sign-in */
 .login { display:flex; align-items:center; justify-content:center; flex:1 1 auto; padding:24px; overflow:auto; }
 .login-box { width:min(560px,100%); border:var(--rule); }
@@ -694,6 +728,7 @@ window.oxm = window.oxm || {};
     rec.disabled = s.source === 'text';
     $('oxm-source').value = s.source;
     $('oxm-lang').value = s.lang;
+    $('oxm-maxspk').value = String(s.maxspk);
     $('oxm-feed').classList.toggle('hidden', s.source !== 'text');
     $('oxm-stream').textContent = s.streaming ? '■ STOP' : '▶ STREAM';
     $('f-model').textContent = s.model;
@@ -709,6 +744,14 @@ window.oxm = window.oxm || {};
   oxm.stream = function () {
     emitEvent('oxm_cmd', {cmd: 'stream', value: {text: document.getElementById('oxm-feed-text').value,
       wpm: +document.getElementById('oxm-wpm').value}});
+  };
+  oxm.rename = function (label, current) {
+    const n = prompt('Name for ' + label + ' (empty = keep the number)', current || '');
+    if (n !== null) oxm.cmd('rename', {label: label, name: n.trim().slice(0, 40)});
+  };
+  oxm.ask = function () {
+    const el = document.getElementById('oxm-ask'); const q = el.value.trim();
+    if (q) { oxm.cmd('ask', q); el.value = ''; }
   };
   oxm.sample = function (t) { document.getElementById('oxm-feed-text').value = t; };
   oxm.invert = function () {
@@ -735,7 +778,11 @@ window.oxm = window.oxm || {};
       this.msg('VERIFYING…');
       emitEvent('oxm_login', {action: 'verify', provider: this.provider, key: key, use_env: !!useEnv});
     },
-    models(list, def) {
+    models(list, def, live) {
+      const lv = document.getElementById('lg-live'); lv.innerHTML = '';
+      const same = document.createElement('option'); same.value = ''; same.textContent = 'SAME AS OVERALL MODEL'; lv.appendChild(same);
+      if (live) { const o = document.createElement('option'); o.value = live; o.textContent = live + ' · FASTEST'; o.selected = true; lv.appendChild(o); }
+      document.getElementById('lg-live-wrap').classList.toggle('hidden', this.provider !== 'anthropic');
       const sel = document.getElementById('lg-model');
       sel.innerHTML = '';
       list.forEach((m) => { const o = document.createElement('option'); o.value = m; o.textContent = m; if (m === def) o.selected = true; sel.appendChild(o); });
@@ -745,6 +792,7 @@ window.oxm = window.oxm || {};
     enter() {
       this.msg('SIGNING IN…');
       emitEvent('oxm_login', {action: 'enter', model: document.getElementById('lg-model').value,
+        live_model: document.getElementById('lg-live').value,
         remember: document.getElementById('lg-remember').checked,
         gemini_key: (document.getElementById('lg-gkey') || {value: ''}).value.trim(),
         deepgram_key: (document.getElementById('lg-dgkey') || {value: ''}).value.trim()});
@@ -808,7 +856,9 @@ def login_page() -> None:
     <div class="row"><button class="btn" onclick="oxm.login.verify(false)">VERIFY KEY</button>{env_btn}</div>
     <div id="lg-msg" class="msg hidden"></div>
     <div id="lg-step2" class="hidden" style="display:grid;gap:14px">
-      <div class="field"><label for="lg-model">ANALYSIS MODEL</label><select id="lg-model"></select></div>
+      <div class="field"><label for="lg-model">OVERALL ANALYSIS MODEL</label><select id="lg-model"></select></div>
+      <div class="field" id="lg-live-wrap"><label for="lg-live">LIVE READS (EVERY SENTENCE)</label><select id="lg-live"></select>
+        <div class="hint">Haiku 5.5 answers in about 2 s at a twentieth of the cost; the overall analysis keeps the model above.</div></div>
       <div class="field" id="lg-asr">
         <label for="lg-gkey">GEMINI API KEY · OPTIONAL</label>
         <input id="lg-gkey" type="password" autocomplete="off" spellcheck="false" placeholder="AIza… (enables server-mic transcription with speaker labels)">
@@ -835,7 +885,8 @@ def login_page() -> None:
                 prov = saved["provider"]
                 keys = saved.get("keys", {})
                 await activate(prov, keys[prov], saved.get("model", ""), keys.get("gemini", "") if prov == "anthropic" else "",
-                               saved.get("gemini_model", ""), keys.get("deepgram", ""))
+                               saved.get("gemini_model", ""), keys.get("deepgram", ""),
+                               saved.get("live_model", FAST_ANTHROPIC_MODEL if prov == "anthropic" else ""))
                 ui.navigate.to("/")
                 return
             if action == "verify":
@@ -848,7 +899,8 @@ def login_page() -> None:
                 ids = await (verify_anthropic(key) if prov == "anthropic" else verify_gemini(key))
                 default = default_anthropic_model(ids) if prov == "anthropic" else default_gemini_model(ids)
                 PENDING[client_id] = {"provider": prov, "key": key, "models": ids}
-                ui.run_javascript(f"oxm.login.models({json.dumps(ids)}, {json.dumps(default)})")
+                live = FAST_ANTHROPIC_MODEL if prov == "anthropic" and FAST_ANTHROPIC_MODEL in ids else ""
+                ui.run_javascript(f"oxm.login.models({json.dumps(ids)}, {json.dumps(default)}, {json.dumps(live)})")
                 return
             if action == "enter":
                 p = PENDING.get(client_id)
@@ -866,14 +918,18 @@ def login_page() -> None:
                 dkey = (a.get("deepgram_key") or "").strip() or os.getenv("DEEPGRAM_API_KEY", "")
                 if dkey:
                     await verify_deepgram(dkey)
-                await activate(p["provider"], p["key"], model, gkey, gmodel, dkey)
+                live_model = a.get("live_model") or ""
+                if live_model and live_model not in p["models"]:
+                    live_model = ""
+                await activate(p["provider"], p["key"], model, gkey, gmodel, dkey, live_model)
                 if a.get("remember"):
                     keys = {p["provider"]: p["key"]}
                     if gkey:
                         keys["gemini"] = gkey
                     if dkey:
                         keys["deepgram"] = dkey
-                    save_credentials({"provider": p["provider"], "model": model, "gemini_model": gmodel, "keys": keys})
+                    save_credentials({"provider": p["provider"], "model": model, "live_model": live_model,
+                                      "gemini_model": gmodel, "keys": keys})
                 PENDING.pop(client_id, None)
                 ui.navigate.to("/")
         except LoginError as exc:
@@ -981,12 +1037,37 @@ def render_overall() -> str:
             dl = "".join(f"<dt>{k}</dt><dd>{e(v)}</dd>" for k, v in fields if v)
             if p.bottom_line:
                 dl += f'<dt>BOTTOM LINE</dt><dd class="bottom">{e(p.bottom_line)}</dd>'
-            spk.append(f'<div class="ov-spk">{badge(p.label)}<div><div class="role">{e(p.label)} · {e(p.role)}</div><dl>{dl}</dl></div></div>')
+            spk.append(f'<div class="ov-spk">{badge(p.label)}<div><div class="role">{e(disp(p.label))} · {e(p.role)}</div><dl>{dl}</dl></div></div>')
         body = (f'<h2 class="ov-headline">{e(syn.headline)}</h2><p class="ov-lead">{e(syn.situation)}</p>'
                 f'<div class="ov-grid">{cards}</div>{sparks_html}{tells_html}'
                 f'<h3 class="ov-sub">SPEAKERS</h3><div class="ov-speakers">{"".join(spk)}</div>')
     busy = " busy" if a and a.synth_running else ""
     return f'{head_html}{rel_html}<div class="ov-scroll"><div class="overall{busy}">{body}</div></div>'
+
+
+def render_answers() -> str:
+    if not S.answers:
+        return ('<p class="empty" style="padding:4px 0">ASK ANYTHING ABOUT THE MEETING: "WHAT DOES SPEAKER 2 REALLY WANT?", '
+                '"WHO HASN\'T BEEN HEARD?", "HOW DO I CLOSE THIS DECISION?"</p>')
+    out = []
+    for item in S.answers[-4:]:
+        if item.get("answer") is None and not item.get("error"):
+            a = '<p class="a busy">thinking…</p>'
+        elif item.get("error"):
+            a = f'<p class="a">{e(item["error"])}</p>'
+        else:
+            a = f'<p class="a">{e(item["answer"])}</p>'
+        out.append(f'<div><p class="q">{e(item["q"])}</p>{a}</div>')
+    return "".join(out)
+
+
+async def run_ask(item: Dict[str, Any]) -> None:
+    try:
+        answer, _cost, err = await S.agent.ask(item["q"])
+        item["answer"], item["error"] = answer, (None if answer else (err or "No answer."))
+    except Exception as exc:
+        item["error"] = f"{type(exc).__name__}: {exc}"
+    S.ask_version += 1
 
 
 def bar(label: str, v: Optional[float], bipolar: bool = False) -> str:
@@ -1064,7 +1145,7 @@ def render_side() -> str:
     if last:
         sm = last.smoothed or {}
         ins = last.insight
-        ind = (f'<p class="mood-line">{e(ins.mood)}<span class="sep"> · </span>{e(last.speaker_id)}'
+        ind = (f'<p class="mood-line">{e(ins.mood)}<span class="sep"> · </span>{e(disp(last.speaker_id))}'
                f'<span class="sep"> · </span>{e(INTERVENTION_LABEL.get(ins.intervention_type, ""))}</p>'
                f'<h4 class="sub">AFFECT</h4><div class="bars">{bar("VALENCE", sm.get("valence"), True)}{bar("AROUSAL", sm.get("arousal"))}</div>'
                f'<h4 class="sub">STATE</h4><div class="bars">{bar("STRESS", sm.get("stress"))}{bar("AGITATION", sm.get("agitation"))}'
@@ -1074,7 +1155,7 @@ def render_side() -> str:
     else:
         ind = '<p class="empty">NO READINGS YET.</p>'
     blocks.append(f'<div class="block"><div class="panel-head"><span>INDICATORS</span><span class="muted">SMOOTHED · '
-                  f'{e(last.speaker_id.upper()) if last else "—"}</span></div>{ind}</div>')
+                  f'{e(disp(last.speaker_id).upper()) if last else "—"}</span></div>{ind}</div>')
 
     # speakers
     stats = a.speaker_stats if a else {}
@@ -1084,12 +1165,13 @@ def render_side() -> str:
         share = 100 * st.words / total
         t = st.ema.get("cognitive_tension_score")
         d = st.ema.get("dominance")
-        spk_rows.append(f'<li class="speaker">{badge(label)}<div><div class="name">{e(label)}</div>'
+        spk_rows.append(f'<li class="speaker">{badge(label)}<div><div class="name rn" title="Click to name this speaker" '
+                        f'onclick="oxm.rename({e(json.dumps(label))}, {e(json.dumps(S.names.get(label, "")))})">{e(disp(label))}</div>'
                         f'<div class="stats">{st.words} WORDS · {share:.0f}% OF TALK · TENSION {f"{t:.1f}" if t is not None else "—"}'
                         f' · DOMINANCE {f"{d:.0f}" if d is not None else "—"}</div>'
                         f'<div class="share"><i style="width:{share:.0f}%"></i></div></div></li>')
     spk_html = f'<ul class="speakers">{"".join(spk_rows)}</ul>' if spk_rows else '<p class="empty">NO SPEAKERS YET.</p>'
-    blocks.append(f'<div class="block"><div class="panel-head"><span>SPEAKERS</span><span class="muted">{len(stats)}</span></div>{spk_html}</div>')
+    blocks.append(f'<div class="block"><div class="panel-head"><span>SPEAKERS</span><span class="muted">{len(stats)} · CLICK A NAME TO RENAME</span></div>{spk_html}</div>')
 
     # ideas (shown right under the next move)
     ideas = [(r.speaker_id, i) for r in analysed for i in r.insight.ideas]
@@ -1133,7 +1215,7 @@ def header_state() -> Dict[str, Any]:
     dg = S.dg_cost + (S.dg.cost if S.dg else 0.0)
     return {
         "status": status, "err": bool(err), "live": S.recording or bool(S.feed_task),
-        "recording": S.recording, "source": S.source, "lang": S.lang,
+        "recording": S.recording, "source": S.source, "lang": S.lang, "maxspk": S.max_speakers,
         "streaming": bool(S.feed_task),
         "model": S.provider.label if S.provider else "—",
         "latency": f"LATENCY {last.latency_s:.1f} S" if last else "LATENCY —",
@@ -1162,14 +1244,14 @@ def export_markdown() -> str:
             lines += ["### Tells", ""] + [f"- **{t.who}:** \"{t.quote}\" — {t.pattern}" for t in syn.tells] + [""]
         lines += ["### Speakers", ""]
         for p in syn.speakers:
-            lines += [f"#### {p.label} · {p.role}", ""] + [f"- **{k}:** {v}" for k, v in (
+            lines += [f"#### {disp(p.label)} · {p.role}", ""] + [f"- **{k}:** {v}" for k, v in (
                 ("Evidence", p.evidence), ("State", p.state), ("Motives", p.motives), ("Defences", p.defenses),
                 ("Relation", p.relation), ("Subtext", p.subtext), ("Bottom line", p.bottom_line), ("Lever", p.lever),
                 ("Credibility", p.credibility)) if v] + [""]
     lines += ["## Transcript", ""]
     for s in S.segs:
         m, sec = divmod(int(s.t), 60)
-        lines.append(f"**[{m:02d}:{sec:02d}] {s.speaker}:** {s.text}")
+        lines.append(f"**[{m:02d}:{sec:02d}] {disp(s.speaker)}:** {s.text}")
         r = res.get(s.uid)
         if r and r.insight:
             ins = r.insight
@@ -1210,6 +1292,9 @@ def header_html() -> str:
   <div class="controls">
     <label>SOURCE <select id="oxm-source" onchange="oxm.cmd('source', this.value)">{src}</select></label>
     <label>LANGUAGE <select id="oxm-lang" onchange="oxm.cmd('lang', this.value)">{langs}</select></label>
+    <label title="Expected number of speakers. AUTO detects it; a fixed number caps the speaker detection.">SPEAKERS
+      <select id="oxm-maxspk" onchange="oxm.cmd('maxspk', this.value)"><option value="0">AUTO</option>
+      <option value="2">2</option><option value="3">3</option><option value="4">4</option><option value="5">5</option><option value="6">6</option></select></label>
     <button class="btn btn-rec" id="oxm-rec" onclick="oxm.cmd('rec')">● REC</button>
     <button class="btn" onclick="oxm.cmd('export')">EXPORT</button>
     <button class="btn" onclick="oxm.cmd('clear')">CLEAR</button>
@@ -1258,11 +1343,18 @@ def index() -> None:
                 ui.html(FEED_HTML, sanitize=False)
             with ui.element("section").classes("panel panel-overall"):
                 overall = ui.html("", sanitize=False).style("display:flex;flex-direction:column;min-height:0;flex:1 1 auto")
+                with ui.element("div").classes("ask"):
+                    ui.html('<div class="panel-head"><span>ASK 0XMOIRA</span><span class="muted">ABOUT THIS MEETING</span></div>',
+                            sanitize=False)
+                    answers = ui.html("", sanitize=False).classes("ask-list")
+                    ui.html('<div class="ask-bar"><input id="oxm-ask" placeholder="Ask about the meeting…" '
+                            'onkeydown="if(event.key===\'Enter\')oxm.ask()"><button class="btn" onclick="oxm.ask()">ASK</button></div>',
+                            sanitize=False)
             with ui.element("aside").classes("panel panel-side"):
                 side = ui.html("", sanitize=False)
         ui.html(FOOTER_HTML, sanitize=False)
 
-    last: Dict[str, Any] = {"t": None, "o": None, "s": None, "h": None}
+    last: Dict[str, Any] = {"t": None, "o": None, "s": None, "h": None, "a": None}
 
     def tick() -> None:
         a = S.agent
@@ -1275,14 +1367,17 @@ def index() -> None:
             t_head.content = (f'<div class="panel-head"><span>TRANSCRIPT</span>'
                               f'<span class="muted">{len(S.segs)} SEGMENTS</span></div>')
             last["t"] = kt
-        ko = (a.synth_version, a.synth_running, a.synth_error, S.version)
+        ko = (a.synth_version, a.synth_running, a.synth_error, S.version, tuple(S.names.values()))
         if ko != last["o"]:
             overall.content = render_overall()
             last["o"] = ko
-        ks = (n_hist, S.version)
+        ks = (n_hist, S.version, len(S.names), tuple(S.names.values()))
         if ks != last["s"]:
             side.content = render_side()
             last["s"] = ks
+        if S.ask_version != last["a"]:
+            answers.content = render_answers()
+            last["a"] = S.ask_version
         hs = header_state()
         if hs != last["h"]:
             ui.run_javascript(f"oxm.apply({json.dumps(hs)})")
@@ -1329,6 +1424,24 @@ def index() -> None:
                     ui.run_javascript("oxm.mic.stop(); setTimeout(() => oxm.mic.start('/oxm/audio'), 300)")
                 elif S.recording and S.source == "dg_system":
                     await start_dg_system()
+            elif cmd == "rename" and isinstance(value, dict):
+                label, name = str(value.get("label", "")), str(value.get("name", "")).strip()[:40]
+                if label:
+                    if name and name not in S.names.values():
+                        S.names[label] = name
+                    elif not name:
+                        S.names.pop(label, None)
+                    S.version += 1
+            elif cmd == "maxspk":
+                S.max_speakers = max(0, min(8, int(value or 0)))
+                if S.voice is not None:
+                    S.voice.set_max_speakers(S.max_speakers)
+                S.version += 1
+            elif cmd == "ask" and isinstance(value, str) and value.strip():
+                item = {"q": value.strip()[:500], "answer": None, "error": None}
+                S.answers.append(item)
+                S.ask_version += 1
+                asyncio.create_task(run_ask(item))
             elif cmd == "analyse":
                 if S.agent and not S.agent.request_synthesis():
                     ui.notify("Nothing to analyse yet, or an analysis is already running.")
