@@ -7,6 +7,7 @@ Anthropic structured outputs and Gemini `responseJsonSchema` accept. Range check
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import logging
@@ -48,6 +49,10 @@ GEMINI_PRICE = (float(os.getenv("OXMOIRA_GEMINI_PRICE_IN", "0.50")), float(os.ge
 # Models that accept server-side refusal fallbacks in the `"default"` form on the Claude API.
 FALLBACK_MODELS = {"claude-sonnet-5-5", "claude-opus-5-5", "claude-opus-5", "claude-fable-5-1"}
 FALLBACK_BETA = "server-side-fallback-2026-07-01"
+# How to switch thinking off for the real-time path (thinking adds seconds per call).
+THINKING_OFF = {"claude-sonnet-5-5": {"type": "between_tools"}}
+for _m in ("claude-haiku-5-5", "claude-sonnet-5", "claude-opus-5", "claude-opus-4-8", "claude-opus-4-7"):
+    THINKING_OFF[_m] = {"type": "disabled"}
 
 
 class LoginError(RuntimeError):
@@ -154,6 +159,7 @@ class AnthropicProvider:
         self.client = anthropic.AsyncAnthropic(api_key=api_key, max_retries=2, timeout=60.0)
         self._fallbacks = model in FALLBACK_MODELS
         self._effort = True
+        self._thinking_off = THINKING_OFF.get(model)
 
     @property
     def label(self) -> str:
@@ -172,7 +178,8 @@ class AnthropicProvider:
         return (inp * p_in + out * p_out + cw * p_in * 1.25 + cr * p_read) / 1_000_000
 
     async def json_call(self, system: str, schema: Dict[str, Any], user_msg: str, max_tokens: int,
-                        effort: str) -> Tuple[Optional[Dict[str, Any]], float, str]:
+                        effort: str, fast: bool = False) -> Tuple[Optional[Dict[str, Any]], float, str]:
+        """`fast`: real-time path, thinking off where the model allows it and no server-side fallback."""
         output_config: Dict[str, Any] = {"format": {"type": "json_schema", "schema": schema}}
         if self._effort:
             output_config["effort"] = effort
@@ -183,8 +190,11 @@ class AnthropicProvider:
             messages=[{"role": "user", "content": user_msg}],
             output_config=output_config,
         )
+        thinking_off = fast and self._thinking_off is not None
+        if thinking_off:
+            kwargs["thinking"] = self._thinking_off
         try:
-            if self._fallbacks:
+            if self._fallbacks and not thinking_off:
                 msg = await self.client.beta.messages.create(**kwargs, betas=[FALLBACK_BETA], fallbacks="default")
             else:
                 msg = await self.client.messages.create(**kwargs)
@@ -192,10 +202,13 @@ class AnthropicProvider:
             text = str(exc).lower()
             if self._fallbacks and "fallback" in text:
                 self._fallbacks = False
-                return await self.json_call(system, schema, user_msg, max_tokens, effort)
+                return await self.json_call(system, schema, user_msg, max_tokens, effort, fast)
             if self._effort and "effort" in text:
                 self._effort = False
-                return await self.json_call(system, schema, user_msg, max_tokens, effort)
+                return await self.json_call(system, schema, user_msg, max_tokens, effort, fast)
+            if thinking_off and "thinking" in text:
+                self._thinking_off = None
+                return await self.json_call(system, schema, user_msg, max_tokens, effort, fast)
             raise
         cost = self._cost(getattr(msg, "model", self.model) or self.model, msg.usage)
         if msg.stop_reason == "refusal":
@@ -307,7 +320,7 @@ class GeminiProvider:
         return (data if isinstance(data, dict) else None), cost, "" if isinstance(data, dict) else "JSON is not an object"
 
     async def json_call(self, system: str, schema: Dict[str, Any], user_msg: str, max_tokens: int,
-                        effort: str) -> Tuple[Optional[Dict[str, Any]], float, str]:
+                        effort: str, fast: bool = False) -> Tuple[Optional[Dict[str, Any]], float, str]:
         return await self.generate(system, [{"text": user_msg}], schema, max(max_tokens, 8192))
 
     async def close(self) -> None:
@@ -362,3 +375,188 @@ class GeminiTranscriber:
             if spk and text:
                 self.recent[spk] = text
         return data
+
+
+# --------------------------------------------------------------------------- #
+# Deepgram live transcription with speaker diarization
+# --------------------------------------------------------------------------- #
+DEEPGRAM_API = "https://api.deepgram.com/v1"
+DEEPGRAM_WS = os.getenv("OXMOIRA_DEEPGRAM_WS", "wss://api.deepgram.com/v1/listen")
+# Streaming list price changes; this is an estimate for the cost display, override via env.
+DEEPGRAM_USD_PER_MIN = float(os.getenv("OXMOIRA_DEEPGRAM_PER_MIN", "0.0077"))
+MAX_TURN_WORDS = 60   # emit long monologues in pieces so the analysis keeps up
+
+
+async def verify_deepgram(api_key: str) -> None:
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.get(f"{DEEPGRAM_API}/projects", headers={"Authorization": f"Token {api_key}"})
+    except httpx.HTTPError as exc:
+        raise LoginError("Cannot reach api.deepgram.com. Check the network.") from exc
+    if resp.status_code in (401, 403):
+        raise LoginError("Deepgram rejected this API key.")
+    if resp.status_code != 200:
+        raise LoginError(f"Deepgram error {resp.status_code}: {resp.text[:200]}")
+
+
+def deepgram_language(ui_lang: str) -> str:
+    if ui_lang == "multi":
+        return "multi"
+    if ui_lang.startswith("de"):
+        return "de"
+    return ui_lang if ui_lang in ("en-US", "en-GB") else "en"
+
+
+class DeepgramLive:
+    """One streaming session: feed 16 kHz mono int16 PCM with `send()`; finished speaker turns arrive via
+    `on_turn(speaker, text, confidence_pct)`, the running partial via `on_interim(speaker, text)`."""
+
+    def __init__(self, api_key: str, language: str, on_turn, on_interim=None, on_error=None) -> None:
+        self.key = api_key
+        self.language = language
+        self.on_turn = on_turn
+        self.on_interim = on_interim
+        self.on_error = on_error
+        self.bytes_sent = 0
+        self._q: "asyncio.Queue[Optional[bytes]]" = asyncio.Queue(maxsize=400)
+        self._ws = None
+        self._tasks: List[asyncio.Task] = []
+        self._pending: List[Dict[str, Any]] = []   # finalized words not yet emitted as a turn
+        self.closed = False
+
+    @property
+    def minutes(self) -> float:
+        return self.bytes_sent / 32000 / 60
+
+    @property
+    def cost(self) -> float:
+        return self.minutes * DEEPGRAM_USD_PER_MIN
+
+    async def start(self) -> None:
+        from websockets.asyncio.client import connect
+        params = {
+            "model": "nova-3", "language": self.language, "encoding": "linear16", "sample_rate": "16000",
+            "channels": "1", "diarize_model": "latest", "punctuate": "true", "smart_format": "true",
+            "interim_results": "true", "endpointing": "300", "utterance_end_ms": "1000", "vad_events": "true",
+        }
+        url = DEEPGRAM_WS + "?" + "&".join(f"{k}={v}" for k, v in params.items())
+        try:
+            self._ws = await connect(url, additional_headers={"Authorization": f"Token {self.key}"},
+                                     open_timeout=10, ping_interval=20, max_size=2 ** 22)
+        except Exception as exc:
+            raise RuntimeError(f"Deepgram connection failed: {exc}") from exc
+        self._tasks = [asyncio.create_task(self._writer()), asyncio.create_task(self._reader()),
+                       asyncio.create_task(self._keepalive())]
+
+    def send(self, pcm: bytes) -> None:
+        if self.closed:
+            return
+        try:
+            self._q.put_nowait(pcm)
+        except asyncio.QueueFull:
+            log.warning("Deepgram send queue full; dropping audio")
+
+    async def stop(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        try:
+            self._q.put_nowait(None)
+        except asyncio.QueueFull:
+            pass
+        try:
+            if self._ws is not None:
+                await self._ws.send(json.dumps({"type": "CloseStream"}))
+                await asyncio.wait_for(self._tasks[1], timeout=3)   # let the reader flush final results
+        except Exception:
+            pass
+        self._flush(all_runs=True)
+        for t in self._tasks:
+            t.cancel()
+        await asyncio.gather(*self._tasks, return_exceptions=True)
+        if self._ws is not None:
+            try:
+                await self._ws.close()
+            except Exception:
+                pass
+
+    async def _writer(self) -> None:
+        while True:
+            chunk = await self._q.get()
+            if chunk is None:
+                return
+            await self._ws.send(chunk)
+            self.bytes_sent += len(chunk)
+
+    async def _keepalive(self) -> None:
+        while True:
+            await asyncio.sleep(5)
+            if self._q.empty():
+                await self._ws.send(json.dumps({"type": "KeepAlive"}))
+
+    async def _reader(self) -> None:
+        try:
+            async for raw in self._ws:
+                if isinstance(raw, bytes):
+                    continue
+                msg = json.loads(raw)
+                typ = msg.get("type")
+                if typ == "Results":
+                    self._on_results(msg)
+                elif typ == "UtteranceEnd":
+                    self._flush(all_runs=True)
+                elif typ == "Error":
+                    self._error(msg.get("description") or msg.get("message") or "unknown error")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            if not self.closed:
+                self._error(f"stream closed: {exc}")
+
+    def _error(self, text: str) -> None:
+        log.error("Deepgram: %s", text)
+        if self.on_error:
+            self.on_error(f"Deepgram: {text}")
+
+    @staticmethod
+    def _runs(words: List[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
+        runs: List[List[Dict[str, Any]]] = []
+        for w in words:
+            if runs and runs[-1][0].get("speaker") == w.get("speaker"):
+                runs[-1].append(w)
+            else:
+                runs.append([w])
+        return runs
+
+    def _emit(self, run: List[Dict[str, Any]]) -> None:
+        text = " ".join(w.get("punctuated_word") or w.get("word", "") for w in run).strip()
+        if not text:
+            return
+        spk = run[0].get("speaker")
+        label = f"Speaker {int(spk) + 1}" if isinstance(spk, int) else "Speaker ?"
+        conf = round(100 * sum(float(w.get("confidence", 0)) for w in run) / len(run))
+        self.on_turn(label, text, conf)
+
+    def _flush(self, all_runs: bool) -> None:
+        runs = self._runs(self._pending)
+        keep: List[Dict[str, Any]] = []
+        if runs and not all_runs and len(runs[-1]) < MAX_TURN_WORDS:
+            keep = runs.pop()
+        for run in runs:
+            self._emit(run)
+        self._pending = keep
+        if self.on_interim:
+            self.on_interim("", "")
+
+    def _on_results(self, msg: Dict[str, Any]) -> None:
+        alts = msg.get("channel", {}).get("alternatives") or [{}]
+        alt = alts[0]
+        words = alt.get("words") or []
+        if msg.get("is_final"):
+            self._pending.extend(words)
+            self._flush(all_runs=bool(msg.get("speech_final")))
+        elif self.on_interim:
+            spk = words[-1].get("speaker") if words else None
+            pending = " ".join(w.get("punctuated_word") or w.get("word", "") for w in self._pending)
+            label = f"Speaker {int(spk) + 1}" if isinstance(spk, int) else ""
+            self.on_interim(label, (pending + " " + alt.get("transcript", "")).strip())

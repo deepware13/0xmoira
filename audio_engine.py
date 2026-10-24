@@ -350,3 +350,49 @@ if __name__ == "__main__":
         asyncio.run(_demo())
     except KeyboardInterrupt:
         pass
+
+
+class RawCapture:
+    """Continuous capture for streaming ASR: 16 kHz mono int16 PCM in ~100 ms blocks, delivered on the event loop
+    via `sink(bytes)`. Used to feed system audio (e.g. BlackHole) into Deepgram."""
+
+    def __init__(self, sink: Callable[[bytes], None], device_hint: Optional[str] = None) -> None:
+        self.sink = sink
+        self.device_hint = device_hint or AudioConfig().device_hint
+        self.level = 0.0
+        self.device_name = ""
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._stream: Optional[sd.InputStream] = None
+        self._src_sr = TARGET_SR
+
+    def start(self) -> None:
+        self._loop = asyncio.get_running_loop()
+        device = _resolve_device(self.device_hint)
+        info = sd.query_devices(device, "input")
+        self.device_name = str(info["name"])
+        channels = max(1, min(2, int(info["max_input_channels"])))
+        for sr in (TARGET_SR, int(info["default_samplerate"])):
+            try:
+                self._src_sr = sr
+                self._stream = sd.InputStream(device=device, channels=channels, samplerate=sr, blocksize=sr // 10,
+                                              dtype="float32", latency="low", callback=self._callback)
+                break
+            except sd.PortAudioError:
+                self._stream = None
+        if self._stream is None:
+            raise RuntimeError(f"Cannot open input device '{self.device_name}'.")
+        self._stream.start()
+        log.info("Streaming capture from '%s' @ %d Hz", self.device_name, self._src_sr)
+
+    def _callback(self, indata: np.ndarray, frames: int, time_info: Any, status: sd.CallbackFlags) -> None:
+        mono = _to_mono_16k(indata.copy(), self._src_sr)
+        self.level = float(np.sqrt(np.mean(mono * mono))) if mono.size else 0.0
+        pcm = np.clip(mono * 32767.0, -32768, 32767).astype(np.int16).tobytes()
+        assert self._loop is not None
+        self._loop.call_soon_threadsafe(self.sink, pcm)
+
+    def stop(self) -> None:
+        if self._stream is not None:
+            self._stream.stop()
+            self._stream.close()
+            self._stream = None

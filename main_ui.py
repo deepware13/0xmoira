@@ -10,11 +10,13 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
+from fastapi import WebSocket, WebSocketDisconnect
 from nicegui import app, ui
 
 from agent_core import BUDGET_USD, SYNTH_EVERY, AgentCore, AnalysisResult
-from audio_engine import AudioConfig, AudioEngine
-from providers import (AnthropicProvider, GeminiProvider, GeminiTranscriber, LoginError, clear_credentials,
+from audio_engine import AudioConfig, AudioEngine, RawCapture
+from providers import (AnthropicProvider, DeepgramLive, GeminiProvider, GeminiTranscriber, LoginError, clear_credentials,
+                       deepgram_language, verify_deepgram,
                        default_anthropic_model, default_gemini_model, load_credentials, mask_key,
                        save_credentials, verify_anthropic, verify_gemini)
 
@@ -25,12 +27,15 @@ log = logging.getLogger("oxmoira.ui")
 # Backend state (single local user; everything runs on NiceGUI's event loop)
 # =========================================================================== #
 SOURCES = {
-    "browser": "BROWSER MIC",
-    "gemini": "SERVER MIC · GEMINI ASR",
-    "endpoint": "SERVER MIC · ASR ENDPOINT",
+    "dg_mic": "MIC · DEEPGRAM",
+    "dg_system": "SYSTEM AUDIO · DEEPGRAM",
+    "browser": "MIC · BROWSER SPEECH",
+    "gemini": "SYSTEM AUDIO · GEMINI",
+    "endpoint": "SYSTEM AUDIO · ASR ENDPOINT",
     "text": "TEXT",
 }
-LANGS = ["en-US", "en-GB", "de-DE", "de-AT", "de-CH"]
+LANGS = ["en-US", "en-GB", "de-DE", "de-AT", "de-CH", "multi"]
+LANG_LABEL = {"multi": "EN+DE"}
 
 
 @dataclass
@@ -46,11 +51,17 @@ class State:
     provider: Any = None
     gemini_asr: Optional[GeminiProvider] = None
     gemini_asr_model: str = ""
+    deepgram_key: str = ""
+    dg: Optional[DeepgramLive] = None
+    raw: Optional[RawCapture] = None
+    dg_cost: float = 0.0
+    spent_start: float = 0.0
+    interim: str = ""
     agent: Optional[AgentCore] = None
     engine: Optional[AudioEngine] = None
     pump: Optional[asyncio.Task] = None
     feed_task: Optional[asyncio.Task] = None
-    source: str = "browser"
+    source: str = "dg_mic"
     lang: str = "en-US"
     speaker: str = "A"
     recording: bool = False
@@ -140,11 +151,90 @@ async def stop_server_mic() -> None:
         S.engine = None
 
 
+def _dg_turn(speaker: str, text: str, confidence: int) -> None:
+    ingest(speaker, text, confidence)
+
+
+def _dg_interim(speaker: str, text: str) -> None:
+    S.interim = f"{speaker} · {text}" if speaker and text else text
+
+
+def _dg_error(message: str) -> None:
+    S.error = message
+
+
+def new_deepgram() -> DeepgramLive:
+    if not S.deepgram_key:
+        raise RuntimeError("Deepgram needs an API key: sign out and add one on the sign-in screen.")
+    return DeepgramLive(S.deepgram_key, deepgram_language(S.lang), _dg_turn, _dg_interim, _dg_error)
+
+
+async def stop_dg() -> None:
+    if S.raw is not None:
+        S.raw.stop()
+        S.raw = None
+    dg, S.dg = S.dg, None
+    if dg is not None:
+        await dg.stop()
+        S.dg_cost += dg.cost
+    S.interim = ""
+
+
+async def start_dg_system() -> None:
+    await stop_dg()
+    dg = new_deepgram()
+    await dg.start()
+    S.dg = dg
+    S.raw = RawCapture(dg.send)
+    try:
+        S.raw.start()
+    except Exception:
+        await stop_dg()
+        raise
+
+
+@app.websocket("/oxm/audio")
+async def audio_ws(ws: WebSocket) -> None:
+    """Browser microphone -> Deepgram relay. The browser sends 16 kHz mono int16 PCM frames."""
+    await ws.accept()
+    if S.agent is None or not S.deepgram_key:
+        await ws.close(code=4001)
+        return
+    await stop_dg()
+    dg = new_deepgram()
+    try:
+        await dg.start()
+    except Exception as exc:
+        S.error, S.recording = str(exc), False
+        await ws.close(code=4002)
+        return
+    S.dg, S.recording = dg, True
+    try:
+        while True:
+            msg = await ws.receive()
+            if msg.get("type") == "websocket.disconnect":
+                break
+            data = msg.get("bytes")
+            if data:
+                dg.send(data)
+    except (WebSocketDisconnect, RuntimeError):
+        pass
+    finally:
+        if S.dg is dg:
+            await stop_dg()
+            S.recording = False
+
+
 async def stop_recording() -> None:
     if S.source in ("gemini", "endpoint"):
         await stop_server_mic()
     elif S.source == "browser":
         ui.run_javascript("oxm.speech.stop()")
+    elif S.source == "dg_mic":
+        ui.run_javascript("oxm.mic.stop()")
+        await stop_dg()
+    elif S.source == "dg_system":
+        await stop_dg()
     S.recording = False
     S.rec_client = None
 
@@ -162,6 +252,8 @@ async def new_session() -> None:
         await S.agent.stop()
     S.agent = AgentCore(S.provider)
     S.agent.start()
+    S.spent_start = S.agent.budget.spent
+    S.dg_cost = 0.0
     S.segs.clear()
     S.speaker_order.clear()
     S.seq = 0
@@ -173,6 +265,7 @@ async def sign_out() -> None:
     if S.recording:
         await stop_recording()
     await stop_feed()
+    await stop_dg()
     if S.agent:
         await S.agent.stop()
         S.agent = None
@@ -189,7 +282,8 @@ async def sign_out() -> None:
     S.version += 1
 
 
-async def activate(provider_name: str, key: str, model: str, gemini_key: str = "", gemini_model: str = "") -> None:
+async def activate(provider_name: str, key: str, model: str, gemini_key: str = "", gemini_model: str = "",
+                   deepgram_key: str = "") -> None:
     if S.provider is not None:
         await sign_out()
     if provider_name == "anthropic":
@@ -200,7 +294,8 @@ async def activate(provider_name: str, key: str, model: str, gemini_key: str = "
         S.provider = GeminiProvider(key, model)
         S.gemini_asr = S.provider
         S.gemini_asr_model = gemini_model or model
-    S.source = "browser"
+    S.deepgram_key = deepgram_key
+    S.source = "dg_mic" if deepgram_key else "browser"
     await new_session()
 
 
@@ -453,6 +548,59 @@ window.oxm = window.oxm || {};
       const el = document.getElementById('oxm-interim'); if (el) el.textContent = '';
     },
   };
+  const WORKLET = "class P extends AudioWorkletProcessor{process(i){const c=i[0]&&i[0][0];if(c)this.port.postMessage(c.slice(0));return true;}}registerProcessor('oxm-cap',P);";
+  function resample(input, from, to) {
+    if (from === to) return input;
+    const ratio = from / to, out = new Float32Array(Math.floor(input.length / ratio));
+    for (let i = 0; i < out.length; i++) { const x = i * ratio, i0 = Math.floor(x), f = x - i0; out[i] = (input[i0] || 0) * (1 - f) + (input[i0 + 1] || 0) * f; }
+    return out;
+  }
+  oxm.mic = {
+    active: false, ws: null, audio: null,
+    async start() {
+      try {
+        const ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/oxm/audio');
+        ws.binaryType = 'arraybuffer';
+        ws.onclose = (ev) => { if (this.active) { this.active = false; this._teardown(); emitEvent('oxm_mic', {state: 'closed', code: ev.code}); } };
+        this.ws = ws;
+        const stream = await navigator.mediaDevices.getUserMedia({audio: {channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true}});
+        let ctx;
+        try { ctx = new AudioContext({sampleRate: 16000}); } catch (err) { ctx = new AudioContext(); }
+        let src;
+        try { src = ctx.createMediaStreamSource(stream); }
+        catch (err) { ctx.close(); ctx = new AudioContext(); src = ctx.createMediaStreamSource(stream); }
+        await ctx.audioWorklet.addModule(URL.createObjectURL(new Blob([WORKLET], {type: 'application/javascript'})));
+        const node = new AudioWorkletNode(ctx, 'oxm-cap');
+        const mute = ctx.createGain(); mute.gain.value = 0;
+        src.connect(node); node.connect(mute).connect(ctx.destination);
+        const rate = ctx.sampleRate;
+        let buf = [], len = 0;
+        node.port.onmessage = (ev) => {
+          const x = resample(ev.data, rate, 16000); buf.push(x); len += x.length;
+          if (len < 1600) return;
+          const out = new Int16Array(len); let o = 0, sum = 0;
+          for (const c of buf) for (let i = 0; i < c.length; i++) { const v = Math.max(-1, Math.min(1, c[i])); sum += v * v; out[o++] = v < 0 ? v * 0x8000 : v * 0x7fff; }
+          buf = []; len = 0;
+          if (ws.readyState === 1) ws.send(out.buffer);
+          const el = document.getElementById('f-level'); if (el) el.style.width = Math.min(100, Math.sqrt(sum / out.length) * 400) + '%';
+        };
+        this.audio = {stream, ctx, node}; this.active = true;
+      } catch (err) {
+        this.stop();
+        emitEvent('oxm_speech_error', {error: (err && err.name === 'NotAllowedError') ? 'not-allowed' : String(err)});
+      }
+    },
+    stop() {
+      this.active = false; this._teardown();
+      if (this.ws) { try { this.ws.close(); } catch (err) {} this.ws = null; }
+      const el = document.getElementById('f-level'); if (el) el.style.width = '0%';
+    },
+    _teardown() {
+      const a = this.audio;
+      if (a) { a.node.port.onmessage = null; a.stream.getTracks().forEach((t) => t.stop()); a.ctx.close(); }
+      this.audio = null;
+    },
+  };
   oxm.stick = true;
   oxm.init = function () {
     const sc = document.querySelector('.transcript');
@@ -482,7 +630,9 @@ window.oxm = window.oxm || {};
     $('f-queue').textContent = s.queue;
     $('f-count').textContent = s.count;
     $('f-spend').textContent = s.spend;
-    $('f-level').style.width = s.level + '%';
+    $('f-spend').title = s.spend_title;
+    if (s.level >= 0) $('f-level').style.width = s.level + '%';
+    if (s.source.startsWith('dg') || s.source === 'gemini' || s.source === 'endpoint') $('oxm-interim').textContent = s.interim;
   };
   oxm.cmd = function (cmd, value) { emitEvent('oxm_cmd', {cmd: cmd, value: value === undefined ? null : value}); };
   oxm.stream = function () {
@@ -525,7 +675,8 @@ window.oxm = window.oxm || {};
       this.msg('SIGNING IN…');
       emitEvent('oxm_login', {action: 'enter', model: document.getElementById('lg-model').value,
         remember: document.getElementById('lg-remember').checked,
-        gemini_key: (document.getElementById('lg-gkey') || {value: ''}).value.trim()});
+        gemini_key: (document.getElementById('lg-gkey') || {value: ''}).value.trim(),
+        deepgram_key: (document.getElementById('lg-dgkey') || {value: ''}).value.trim()});
     },
     msg(text, err) {
       const m = document.getElementById('lg-msg');
@@ -561,7 +712,8 @@ def login_page() -> None:
     saved_html = ""
     if saved.get("provider") and saved.get("keys", {}).get(saved["provider"]):
         k = saved["keys"][saved["provider"]]
-        saved_html = (f'<div class="msg"><b>SAVED ON THIS MAC:</b> {e(saved["provider"].upper())} · {e(saved.get("model", ""))} · {e(mask_key(k))}'
+        dg_note = " · DEEPGRAM" if saved.get("keys", {}).get("deepgram") else ""
+        saved_html = (f'<div class="msg"><b>SAVED ON THIS MAC:</b> {e(saved["provider"].upper())} · {e(saved.get("model", ""))} · {e(mask_key(k))}{dg_note}'
                       f'<div class="row" style="margin-top:8px"><button class="btn" onclick="emitEvent(\'oxm_login\',{{action:\'saved\'}})">CONTINUE</button>'
                       f'<button class="btn btn-small" onclick="emitEvent(\'oxm_login\',{{action:\'forget\'}})">FORGET</button></div></div>')
     env_btn = ('<button class="btn btn-small" id="lg-env" onclick="oxm.login.verify(true)">USE KEY FROM ENVIRONMENT</button>'
@@ -590,6 +742,10 @@ def login_page() -> None:
         <label for="lg-gkey">GEMINI API KEY · OPTIONAL</label>
         <input id="lg-gkey" type="password" autocomplete="off" spellcheck="false" placeholder="AIza… (enables server-mic transcription with speaker labels)">
       </div>
+      <div class="field">
+        <label for="lg-dgkey">DEEPGRAM API KEY · RECOMMENDED</label>
+        <input id="lg-dgkey" type="password" autocomplete="off" spellcheck="false" placeholder="Live transcript in ~0.3 s with voice-based speaker separation">
+      </div>
       <label class="check"><input type="checkbox" id="lg-remember" checked> REMEMBER ON THIS MAC (~/.oxmoira, owner-only)</label>
       <div class="row"><button class="btn" onclick="oxm.login.enter()">ENTER ▸</button></div>
     </div>
@@ -608,7 +764,7 @@ def login_page() -> None:
                 prov = saved["provider"]
                 keys = saved.get("keys", {})
                 await activate(prov, keys[prov], saved.get("model", ""), keys.get("gemini", "") if prov == "anthropic" else "",
-                               saved.get("gemini_model", ""))
+                               saved.get("gemini_model", ""), keys.get("deepgram", ""))
                 ui.navigate.to("/")
                 return
             if action == "verify":
@@ -636,11 +792,16 @@ def login_page() -> None:
                     gmodel = default_gemini_model(await verify_gemini(gkey))
                 elif p["provider"] == "gemini":
                     gmodel = default_gemini_model(p["models"])
-                await activate(p["provider"], p["key"], model, gkey, gmodel)
+                dkey = (a.get("deepgram_key") or "").strip() or os.getenv("DEEPGRAM_API_KEY", "")
+                if dkey:
+                    await verify_deepgram(dkey)
+                await activate(p["provider"], p["key"], model, gkey, gmodel, dkey)
                 if a.get("remember"):
                     keys = {p["provider"]: p["key"]}
                     if gkey:
                         keys["gemini"] = gkey
+                    if dkey:
+                        keys["deepgram"] = dkey
                     save_credentials({"provider": p["provider"], "model": model, "gemini_model": gmodel, "keys": keys})
                 PENDING.pop(client_id, None)
                 ui.navigate.to("/")
@@ -821,12 +982,6 @@ def render_side() -> str:
     blocks = [f'<div class="block"><div class="panel-head"><span>YOUR NEXT MOVE</span>'
               f'<span class="muted">{e(f"{last.latency_s:.1f} S" if last else "—")}</span></div>{action}</div>']
 
-    # tension
-    svg, legend = tension_svg(hist)
-    num = f'{last.insight.cognitive_tension_score}<small>/10</small>' if last else '—'
-    blocks.append(f'<div class="block"><div class="panel-head"><span>TENSION</span><span class="muted">LAST 40 UTTERANCES</span></div>'
-                  f'<div class="tension"><div class="num">{num}</div>{svg}</div>{legend}</div>')
-
     # indicators (smoothed, for the most recent analysed speaker)
     if last:
         sm = last.smoothed or {}
@@ -891,9 +1046,13 @@ def header_state() -> Dict[str, Any]:
         status = "STREAMING TEXT"
     else:
         status = "READY · " + SOURCES[S.source]
-    level = 0
+    level = -1 if S.source in ("dg_mic", "browser") else 0
     if S.engine is not None:
         level = min(100, int(S.engine.level * 2000))
+    elif S.raw is not None:
+        level = min(100, int(S.raw.level * 400))
+    llm = (a.budget.spent - S.spent_start) if a else 0.0
+    dg = S.dg_cost + (S.dg.cost if S.dg else 0.0)
     return {
         "status": status, "err": bool(err), "live": S.recording or bool(S.feed_task),
         "recording": S.recording, "source": S.source, "lang": S.lang, "speaker": S.speaker,
@@ -902,8 +1061,10 @@ def header_state() -> Dict[str, Any]:
         "latency": f"LATENCY {last.latency_s:.1f} S" if last else "LATENCY —",
         "queue": f"QUEUE {a.inbox.qsize() if a else 0}",
         "count": f"UTTERANCES {len(S.segs)}",
-        "spend": f"SPEND ${a.budget.spent:.3f} / ${BUDGET_USD:.0f}" if a else "SPEND —",
+        "spend": f"COST ${llm + dg:.3f}",
+        "spend_title": f"This session: AI ${llm:.4f} + transcription ${dg:.4f} (estimates)",
         "level": level,
+        "interim": S.interim,
     }
 
 
@@ -959,7 +1120,7 @@ async def run_feed(text: str, wpm: int) -> None:
 # =========================================================================== #
 def header_html() -> str:
     src = "".join(f'<option value="{k}">{e(v)}</option>' for k, v in SOURCES.items())
-    langs = "".join(f'<option value="{k}">{k.upper()}</option>' for k in LANGS)
+    langs = "".join(f'<option value="{k}">{LANG_LABEL.get(k, k.upper())}</option>' for k in LANGS)
     chips = "".join(f'<span class="spk spk-{i}" data-spk="{c}" title="Current speaker {c}" onclick="oxm.cmd(\'speaker\',\'{c}\')">{c}</span>'
                     for i, c in enumerate("ABCD"))
     return f"""
@@ -994,7 +1155,7 @@ FEED_HTML = f"""
 FOOTER_HTML = """
 <footer class="bar foot">
   <span id="f-model">—</span><span id="f-latency">LATENCY —</span><span id="f-queue">QUEUE 0</span>
-  <span id="f-count">UTTERANCES 0</span><span id="f-spend">SPEND —</span>
+  <span id="f-count">UTTERANCES 0</span><span id="f-spend">COST $0.000</span>
   <span class="level" title="Server-mic input level"><i id="f-level"></i></span>
 </footer>"""
 
@@ -1057,7 +1218,18 @@ def index() -> None:
                     await stop_recording()
                 elif S.source == "browser":
                     S.recording, S.rec_client, S.error = True, client_id, ""
-                    ui.run_javascript(f"oxm.speech.start({json.dumps(S.lang)})")
+                    sp_lang = "en-US" if S.lang == "multi" else S.lang
+                    ui.run_javascript(f"oxm.speech.start({json.dumps(sp_lang)})")
+                elif S.source == "dg_mic":
+                    if not S.deepgram_key:
+                        raise RuntimeError("Deepgram needs an API key: sign out and add one on the sign-in screen.")
+                    S.error, S.rec_client = "", client_id
+                    S.recording = True
+                    ui.run_javascript("oxm.mic.start()")
+                elif S.source == "dg_system":
+                    S.error = ""
+                    await start_dg_system()
+                    S.recording = True
                 elif S.source in ("gemini", "endpoint"):
                     S.error = ""
                     await start_server_mic()
@@ -1069,7 +1241,13 @@ def index() -> None:
             elif cmd == "lang" and value in LANGS:
                 S.lang = value
                 if S.recording and S.source == "browser":
-                    ui.run_javascript(f"oxm.speech.stop(); oxm.speech.start({json.dumps(value)})")
+                    sp_lang = "en-US" if value == "multi" else value
+                    ui.run_javascript(f"oxm.speech.stop(); oxm.speech.start({json.dumps(sp_lang)})")
+                elif S.recording and S.source == "dg_mic":
+                    await stop_dg()
+                    ui.run_javascript("oxm.mic.stop(); setTimeout(() => oxm.mic.start(), 300)")
+                elif S.recording and S.source == "dg_system":
+                    await start_dg_system()
             elif cmd == "speaker" and isinstance(value, str):
                 S.speaker = value
             elif cmd == "analyse":
@@ -1113,12 +1291,20 @@ def index() -> None:
             S.error = "Microphone or speech recognition was blocked in the browser."
         else:
             S.error = f"Speech recognition: {err}"
-        if err in ("not-supported", "not-allowed", "service-not-allowed"):
+        if err in ("not-supported", "not-allowed", "service-not-allowed") or S.source == "dg_mic":
             S.recording = False
 
     ui.on("oxm_cmd", on_cmd)
     ui.on("oxm_final", on_final)
     ui.on("oxm_speech_error", on_speech_error)
+
+    def on_mic(ev: Any) -> None:
+        if event_args(ev).get("state") == "closed" and S.source == "dg_mic" and S.recording:
+            S.recording = False
+            if not S.error:
+                S.error = "Live transcription connection closed. Press REC to reconnect."
+
+    ui.on("oxm_mic", on_mic)
     ui.timer(0.25, tick)
     ui.timer(0.6, lambda: ui.run_javascript("oxm.init()"), once=True)
 

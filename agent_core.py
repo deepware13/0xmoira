@@ -23,7 +23,8 @@ SYNTH_EVERY = int(os.getenv("OXMOIRA_SYNTH_EVERY", "6"))   # analysed utterances
 SYNTH_MAX_CHARS = 9000
 MAX_OUTPUT_TOKENS = 4000          # includes the model's (adaptive) thinking
 SYNTH_OUTPUT_TOKENS = 8000
-ANALYSIS_EFFORT = "low"           # real-time path: fast and cheap
+ANALYSIS_EFFORT = "low"           # real-time path: fast and cheap (thinking off where the model allows)
+MAX_INFLIGHT = int(os.getenv("OXMOIRA_INFLIGHT", "3"))   # concurrent per-utterance analyses
 SYNTH_EFFORT = "medium"
 MIN_WORDS_TO_ANALYZE = 3
 MIN_PROFILE_WORDS = 25           # below this a speaker gets no deep profile
@@ -482,30 +483,43 @@ class AgentCore:
 
     # ---- loop ------------------------------------------------------------
     async def _run(self) -> None:
+        sem = asyncio.Semaphore(MAX_INFLIGHT)
         while True:
             payload = await self.inbox.get()
-            # Backlog collapse: if analysis fell behind, absorb older utterances into the window
-            # without paying for a call each, and analyze only the newest.
-            while not self.inbox.empty():
+            # Backlog collapse: if analysis fell far behind, absorb older utterances into the window
+            # without paying for a call each.
+            while self.inbox.qsize() > MAX_INFLIGHT * 2:
                 stale = payload
-                self._remember(stale, None)
+                self._remember(stale)
                 self._emit(AnalysisResult(stale.utterance_id, stale.speaker, stale.text, None,
                                           0.0, 0.0, self.budget.spent, "backlog-collapsed", time.time(),
                                           unreliable=stale.unreliable))
                 payload = self.inbox.get_nowait()
-            try:
-                result = await self._analyze(payload)
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:  # keep the loop alive no matter what
-                log.exception("Analysis failed")
-                self.last_error = f"{type(exc).__name__}: {exc}"
-                self._remember(payload, None)
-                result = AnalysisResult(payload.utterance_id, payload.speaker, payload.text, None,
-                                        0.0, 0.0, self.budget.spent, f"error: {self.last_error}", time.time(),
-                                        unreliable=payload.unreliable)
-            self._emit(result)
-            if result.insight is not None and SYNTH_EVERY > 0:
+            # Context is captured now, in arrival order, so concurrent calls each see what came before them.
+            context = self._render_window()
+            baseline = self._baseline(payload.speaker)
+            entry = self._remember(payload)
+            await sem.acquire()
+            asyncio.create_task(self._analyze_task(payload, entry, context, baseline, sem))
+
+    async def _analyze_task(self, payload: ASRPayload, entry: Dict[str, Any], context: str, baseline: str,
+                            sem: asyncio.Semaphore) -> None:
+        try:
+            result = await self._analyze(payload, entry, context, baseline)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # keep the pipeline alive no matter what
+            log.exception("Analysis failed")
+            self.last_error = f"{type(exc).__name__}: {exc}"
+            result = AnalysisResult(payload.utterance_id, payload.speaker, payload.text, None,
+                                    0.0, 0.0, self.budget.spent, f"error: {self.last_error}", time.time(),
+                                    unreliable=payload.unreliable)
+        finally:
+            sem.release()
+        self._emit(result)
+        if result.insight is not None:
+            self.last_error = ""
+            if SYNTH_EVERY > 0:
                 self._since_synth += 1
                 if self._since_synth >= SYNTH_EVERY and not self.synth_running:
                     self.request_synthesis()
@@ -514,14 +528,16 @@ class AgentCore:
         self.history.append(result)
         self.results.put_nowait(result)
 
-    def _remember(self, p: ASRPayload, insight: Optional[Insight]) -> None:
-        self.window.append({"speaker": p.speaker, "text": p.text, "insight": insight, "unreliable": p.unreliable,
-                            "confidence": p.confidence})
+    def _remember(self, p: ASRPayload) -> Dict[str, Any]:
+        entry = {"speaker": p.speaker, "text": p.text, "insight": None, "unreliable": p.unreliable,
+                 "confidence": p.confidence}
+        self.window.append(entry)
         self.transcript.append((p.speaker, p.text, p.unreliable))
         st = self.speaker_stats.setdefault(p.speaker, SpeakerStats())
         st.words += len(p.text.split())
         if p.unreliable:
             st.unreliable += 1
+        return entry
 
     @staticmethod
     def _line(speaker: str, text: str, confidence: Optional[int], unreliable: bool) -> str:
@@ -549,11 +565,11 @@ class AgentCore:
 
     # ---- tool-call plumbing -------------------------------------------------
     async def _json_call(self, system: str, schema: Dict[str, Any], user_msg: str, max_tokens: int,
-                         effort: str, parse: Callable[[Dict[str, Any]], Any]) -> Tuple[Any, float, str]:
+                         effort: str, parse: Callable[[Dict[str, Any]], Any], fast: bool = False) -> Tuple[Any, float, str]:
         total_cost = 0.0
         last_err = ""
         for _ in range(2):
-            data, cost, err = await self.provider.json_call(system, schema, user_msg, max_tokens, effort)
+            data, cost, err = await self.provider.json_call(system, schema, user_msg, max_tokens, effort, fast)
             total_cost += cost
             self.budget.add_cost(cost)
             if data is None:
@@ -573,15 +589,14 @@ class AgentCore:
         return (est_in * p_in + out_tokens * p_out) / 1_000_000
 
     # ---- per-utterance analysis ---------------------------------------------
-    async def _analyze(self, p: ASRPayload) -> AnalysisResult:
+    async def _analyze(self, p: ASRPayload, entry: Dict[str, Any], context: str, baseline: str) -> AnalysisResult:
         if len(p.text.split()) < MIN_WORDS_TO_ANALYZE:
-            self._remember(p, None)
             return AnalysisResult(p.utterance_id, p.speaker, p.text, None, 0.0, 0.0,
                                   self.budget.spent, "too-short", time.time(), unreliable=p.unreliable)
 
         user_msg = (
-            f"WINDOW (oldest to newest):\n{self._render_window()}\n\n"
-            f"{self._baseline(p.speaker)}\n\n"
+            f"WINDOW (oldest to newest):\n{context}\n\n"
+            f"{baseline}\n\n"
             f"NEW UTTERANCE:\n{self._line(p.speaker, p.text, p.confidence, p.unreliable)}"
         )
         self.budget.check(self._worst_case(SYSTEM_PROMPT, user_msg, MAX_OUTPUT_TOKENS))
@@ -605,10 +620,11 @@ class AgentCore:
             return ins
 
         t0 = time.monotonic()
-        insight, cost, err = await self._json_call(SYSTEM_PROMPT, INSIGHT_SCHEMA, user_msg, MAX_OUTPUT_TOKENS, ANALYSIS_EFFORT, parse)
+        insight, cost, err = await self._json_call(SYSTEM_PROMPT, INSIGHT_SCHEMA, user_msg, MAX_OUTPUT_TOKENS, ANALYSIS_EFFORT, parse,
+                                                   fast=True)
         latency = time.monotonic() - t0
 
-        self._remember(p, insight)
+        entry["insight"] = insight
         smoothed: Dict[str, float] = {}
         if insight is not None:
             st = self.speaker_stats[p.speaker]
